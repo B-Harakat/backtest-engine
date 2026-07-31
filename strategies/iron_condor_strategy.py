@@ -1,23 +1,21 @@
 """
 0DTE short iron condor — written to exercise the engine's multi-leg support across BOTH option
-rights simultaneously (a call spread + a put spread in one position), not as a strategy with real
-trading edge.
+rights simultaneously (a call credit spread + a put credit spread in one position), not as a
+strategy with real trading edge. run_mc-compatible: 0DTE (entry day == expiration day), with a
+module-level ``GRID`` for parameter exploration.
 
-At 10:30am ET, sells the nearest OTM call and buys a further OTM call (`spread_width` listed
-strikes further out — the call credit spread / upside wing), AND sells the nearest OTM put and
-buys a further OTM put (same `spread_width`, the put credit spread / downside wing) — four
-independent single-leg orders, all tagged with one shared `group_id`. Calls and puts are fetched
-from two independent chain snapshots (`Strategy.get_chain_snapshot(..., right="call"/"put")`) --
-see engine/thetadata_client.py and engine/data_store.py, which cache and warm each side
-completely separately.
+Each session at ``entry_time`` ET, sells the nearest OTM call and buys a further OTM call
+(`spread_width` listed strikes further out — the upside call wing), AND sells the nearest OTM
+put and buys a further OTM put (same `spread_width` — the downside put wing). Four independent
+single-leg orders, all tagged with one shared ``group_id``. Calls and puts come from two
+independent chain snapshots (`Strategy.get_chain_snapshot(..., right="call"/"put")`), which are
+cached/warmed separately.
 
-Both SHORT legs (the ones actually at risk) carry their own independent stop-loss, checked and
-managed completely independently of each other and of the two long legs: a rally can stop out the
-short call while the short put and both long legs are left alone, a selloff can stop out the short
-put while the short call and both long legs are left alone, both can happen on the same day, or
-neither may happen at all -- whatever remains open at end of day settles/force-closes through the
-normal engine mechanisms exactly as if all four legs were entirely unrelated single-leg positions,
-because that's exactly what they are as far as the ledger is concerned.
+Both SHORT legs (the actually-at-risk ones) carry their own independent stop: a short leg is
+bought back on its own if its current ask rises past `short_leg_stop_multiple` x its entry credit.
+Each short leg is managed independently of the other and of the two long wings. Whatever remains
+open at end of day settles/force-closes through the normal engine mechanisms (as independent
+single-leg positions, which is exactly what they are to the ledger).
 """
 
 from __future__ import annotations
@@ -36,6 +34,16 @@ logger = logging.getLogger(__name__)
 
 ENTRY_TIME = time(10, 30)
 
+# Monte Carlo grid (consumed by simulation.monte_carlo.expand_grid / scripts/run_mc.py via the
+# --strategy spec). Sparse: only the params listed here are varied across the Cartesian product;
+# any other constructor arg keeps its own default (partial override). `entry_time` is a
+# constructor param, see __init__.
+GRID = {
+    "spread_width": [2, 3],
+    "short_leg_stop_multiple": [1.5, 3.0],
+    "entry_time": [time(10, 0), time(11, 0)],
+}
+
 
 @dataclass
 class _ShortLeg:
@@ -45,39 +53,42 @@ class _ShortLeg:
 
 
 class IronCondorStrategy(Strategy):
+    """4-leg 0DTE short iron condor: short call + long call (call wing) and short put + long put
+    (put wing), each short leg independently stop-managed."""
+
     def __init__(
         self,
         underlying: str = "XSP",
         quantity: int = 1,
-        spread_width: int = 2,  # how many listed strikes separate each short leg from its long wing
-        short_leg_stop_multiple: float = 2.0,  # buy back a short leg alone if its cost doubles
+        spread_width: int = 2,  # listed strikes between each short leg and its long wing
+        short_leg_stop_multiple: float = 2.0,  # buy back a short leg alone if its cost exceeds this multiple of its credit
+        entry_time: time = ENTRY_TIME,  # intraday time (ET) to enter the condor each session
     ):
         super().__init__()
         self.underlying = underlying
         self.quantity = quantity
         self.spread_width = spread_width
         self.short_leg_stop_multiple = short_leg_stop_multiple
+        self.entry_time = entry_time
 
         self._entered_on: Optional[date] = None
         self._warmed_chains_on: Optional[date] = None
-
         self._short_call: Optional[_ShortLeg] = None
         self._short_put: Optional[_ShortLeg] = None
         self._group_id: Optional[str] = None
 
     def initialize(self) -> None:
-        pass  # legs aren't known until we see the day's chains at 10:30am
+        pass  # legs aren't known until we see the day's chains at the entry time
 
     def on_bar(self, ts: datetime) -> None:
         if self._warmed_chains_on != ts.date():
-            # First bar of a new session -- warm both sides' chains right away rather than
-            # waiting for the entry time (see strategies/my_strategy.py for why this is separate
-            # from the entry-time check below). Calls and puts are independent fetches/caches.
+            # Warm both sides' chains on the first bar of each session (calls and puts are
+            # independent fetches/caches), separate from the entry-time check below.
             self.get_chain_snapshot(self.underlying, ts.date(), right="call")
             self.get_chain_snapshot(self.underlying, ts.date(), right="put")
             self._warmed_chains_on = ts.date()
 
-        if ts.time() == ENTRY_TIME and self._entered_on != ts.date():
+        if ts.time() == self.entry_time and self._entered_on != ts.date():
             self._enter_condor(ts)
 
         if self._short_call is not None and not self._short_call.closed:
@@ -91,7 +102,9 @@ class IronCondorStrategy(Strategy):
         put_chain = self.get_chain_snapshot(self.underlying, expiration, right="put")
 
         required_cols = {"underlying_price", "bid", "ask"}
-        if call_chain.empty or put_chain.empty or not required_cols.issubset(call_chain.columns) or not required_cols.issubset(put_chain.columns):
+        if (call_chain.empty or put_chain.empty
+                or not required_cols.issubset(call_chain.columns)
+                or not required_cols.issubset(put_chain.columns)):
             logger.warning("No usable call+put chains for %s on %s -- skipping condor entry.", self.underlying, expiration)
             self._entered_on = expiration
             return
@@ -142,12 +155,9 @@ class IronCondorStrategy(Strategy):
         )
 
     def _check_short_leg_stop(self, leg: _ShortLeg) -> None:
-        """
-        Independent leg management -- this is the part of the strategy specifically meant to
-        exercise "close one leg of a multi-leg position independently of the others," now with
-        two short legs (call and put) that can each be stopped out on their own schedule, driven
-        by opposite market moves, without ever touching each other or either long leg.
-        """
+        """Close one short leg alone (buy-to-close at its current ask) if its cost has risen past
+        `short_leg_stop_multiple` x the credit it collected at entry, leaving the other legs (and
+        both long wings) untouched. Exercises the engine's independent multi-leg close."""
         quote = self.get_quote(leg.contract)
         if quote is None:
             return  # no data yet this bar -- try again next bar

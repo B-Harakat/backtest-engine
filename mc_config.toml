@@ -1,0 +1,47 @@
+# Sample TOML config for the synthetic-market Monte Carlo harness (scripts/run_mc.py).
+# Load via `--config mc_config.toml`. CLI flags override these values; these values override the
+# built-in defaults in simulation/bates.BatesParams and simulation/market_maker. Any section or
+# key may be omitted to fall back to defaults. This file only configures the MARKET MODEL and
+# runtime knobs -- the strategy and its grid come from the strategy module's GRID (see
+# scripts/run_mc.py --strategy), keeping everything model/strategy agnostic.
+
+[bates]
+# Bates (Heston + jumps). All drift/vol/size params are ANNUALIZED decimals (0.20 = 20%).
+mu = 0.0          # continuous diffusive drift. 0 = neutral.
+kappa = 3.0       # Heston mean-reversion speed for variance.
+theta = 0.04      # Heston long-run variance (0.04 => 20% vol).
+sigma_v = 0.30    # vol-of-vol.
+rho = -0.7        # spot/vol correlation (negative = leverage effect).
+# V_0: opening VARIANCE. Default is derived DYNAMICALLY from the cached real chain for --day
+# (ATM IV squared). To override, uncomment the line below (variance = vol^2, e.g. 0.15^2 = 0.0225).
+# V_0 = 0.0225
+# Merton jump component -- expect jumps to be essentially absent unless lambda_ is raised well
+# above these (2+ per year with sigma_j sized to your event moves).
+lambda_ = 0.5     # expected jumps per year.
+mu_j = 0.0        # mean log-jump size.
+sigma_j = 0.02    # log-jump size std.
+
+[spread]
+# Bid/ask model (the engine has no slippage, so this is the execution-cost lever).
+half_spread_frac = 0.005   # proportional half-width each side (0.5% => 1% total width).
+tick_size = 0.05           # absolute half-width floor (XSP tick).
+spread_noise_std = 0.0     # per-bar multiplicative noise std (0 = deterministic).
+
+[strike_grid]
+# How the synthetic chain enumerates strikes around the path's spot.
+step = 1.0           # strike spacing.
+margin_frac = 0.15   # fractional band each side of spot.
+min_strikes = 10     # floor on strike count per side.
+
+[runtime]
+# Defaults for knobs that CLI flags can also set (CLI wins if both present).
+n_paths = 100
+starting_cash = 10000.0
+multiplier = 100
+settlement_time = "16:00"   # HH:MM 24h ET -- XSP weeklies/0DTE are PM-settled.
+cost_model = "ibkr"         # "ibkr" | "none".
+seed = 0                    # master seed; CLI --seed -1 disables determinism.
+# ticker and s0 override the cache-derived opening market when set here (CLI --ticker/--s0
+# still win). Omit both to derive s0 (opening spot) from the cached chain for --day.
+# ticker = "XSP"
+# s0 = 675.0

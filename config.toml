@@ -1,0 +1,47 @@
+# Configuration properties for Theta Terminal 3
+
+
+host = "0.0.0.0"
+port = 25503
+log_directory = "/tmp"
+
+[env]
+mdds_type = "PROD"
+
+[auth]
+base_url = "https://nexus-api.thetadata.us/identity/terminal/auth_user"
+
+[mdds]
+enable=true
+
+[mdds_server]
+host = "mdds-01.thetadata.us"
+port = 443
+tls = true
+
+[mdds_stage]
+host = "mdds-stage.thetadata.us"
+port = 443
+tls = true
+
+[fpss]
+# Whether to enable FPSS (streaming data over websockets)
+enable=true
+# How long should the FPSS client wait to reconnect after the connection is lost.
+reconnect_wait=1000
+# The queue length of messages that the Theta Terminal can use as a buffer if the consumer of FPSS messages is slow.
+# Increasing this value will reduce or even eliminate the chances of stream messages being dropped.
+# Beware that increasing this value will make the terminal consume more memory.
+fpss_queue_depth=1000000
+# WebSocket server port.
+ws_port=25520
+#------------------------------------------------ FPSS HOSTS ------------------------------------------------
+# The FPSS region to connect to. The IP and port series is cycled through while trying to connect to a server (left to right).
+fpss_region="fpss_nj_hosts"
+# Production servers located in our New Jersey Campus.
+fpss_nj_hosts="nj-a.thetadata.us:20000,nj-a.thetadata.us:20001,nj-b.thetadata.us:20000,nj-b.thetadata.us:20001"
+# TESTING ONLY! Occasional reboots. Potential issues with data and certain requests. This server is not stable.
+fpss_stage_hosts="nj-a.thetadata.us:20100,test-server.thetadata.us:20100,test-server.thetadata.us:20101"
+# TESTING ONLY! Frequent reboots. Constant replay of historical data. Potential issues with data and certain requests. This server is not stable.
+fpss_dev_hosts="nj-a.thetadata.us:20200,test-server.thetadata.us:20200,test-server.thetadata.us:20201"
+

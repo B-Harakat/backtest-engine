@@ -94,9 +94,6 @@ class Position:
     def market_value(self, mark_price: float, multiplier: int = DEFAULT_OPTION_MULTIPLIER) -> float:
         return self.qty * mark_price * multiplier
 
-    def unrealized_pnl(self, mark_price: float, multiplier: int = DEFAULT_OPTION_MULTIPLIER) -> float:
-        return (mark_price - self.avg_price) * self.qty * multiplier
-
 
 @dataclass
 class Fill:
@@ -107,3 +104,6 @@ class Fill:
     timestamp: datetime
     reason: str = "ORDER"  # "ORDER" | "EXPIRY_CASH_SETTLEMENT"
     group_id: Optional[str] = None
+    # Total transaction cost (USD) for this fill (commission + regulatory/clearing fees). Only
+    # real order fills carry a non-zero value; synthetic expiration settlements set it to 0.
+    commission: float = 0.0

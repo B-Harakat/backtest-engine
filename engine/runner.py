@@ -3,7 +3,7 @@ Composition root — `run_backtest()` is the one function that wires everything 
 together into an actual backtest. No threading, no scheduler: this is a plain loop over
 `calendar.trading_minutes()`.
 
-Per-bar sequence, matching the architecture guideline section 4:
+Per-bar sequence:
     1. strategy.on_bar(ts)      -- strategy may submit orders
     2. fill engine processes all open orders against this bar's quotes
     3. on the last bar of a session: strategy.before_close(ts), then process any orders it
@@ -14,27 +14,22 @@ Per-bar sequence, matching the architecture guideline section 4:
 There is no separate "underlying index" feed here: ThetaData's Index/Stock history endpoints
 require a subscription tier beyond Options Standard. The underlying's price is instead sourced
 from data you already have access to — per-position, from `option_history_greeks_first_order`'s
-embedded `underlying_price` column (used below for cash settlement), and for pre-trade strike
-selection, via `Strategy.get_chain_snapshot()` (see engine.thetadata_client.fetch_chain_from_thetadata).
+embedded `underlying_price` column (used for cash settlement), and for pre-trade strike selection,
+via `Strategy.get_chain_snapshot()` (see engine.thetadata_client.fetch_chain_from_thetadata).
 
 This engine assumes ONE underlying (and one multiplier, one settlement style) per backtest run —
-set via `run_backtest`'s parameters, not inferred from the traded contracts. Trading several
-different underlyings with different multipliers/settlement conventions in the same run isn't
-supported; run separate backtests instead.
+set via `run_backtest`'s parameters, not inferred from the traded contracts.
 
 Settlement styles:
     "cash" (default) — the underlying is a cash-settled, European-style product (XSP, SPX
         weeklies/0DTE, RUT, NDX, VIX). Expiring positions are cash-settled at intrinsic value —
         see engine.settlement.expire_and_settle.
     "physical" — the underlying's real-world options are American-style and physically settled
-        (single-stock/ETF options). This engine NEVER simulates physical settlement: instead,
-        any position still open on its own expiration day is force-closed via an ordinary market
-        order (at that contract's own bid/ask) during the day's last bar, before the actual
-        exercise/assignment decision would occur (which happens after the close). This does NOT
-        model early-assignment risk on short positions held on earlier days — a counterparty
-        could in principle exercise early at any time before expiration, which this engine has no
-        visibility into or control over. It only guarantees the engine itself never carries a
-        position through to its own expiration/physical settlement.
+        (single-stock/ETF options). This engine NEVER simulates physical settlement: any position
+        still open on its own expiration day is force-closed via an ordinary market order during
+        the day's last bar, before the actual exercise/assignment decision would occur (which
+        happens after the close). Early-assignment risk on short positions held on earlier days is
+        not modeled. See `_force_close_expiring_positions`.
 """
 
 from __future__ import annotations
@@ -47,7 +42,8 @@ from typing import Literal, Optional
 
 import pandas as pd
 
-from engine.calendar import session_bounds, session_close, session_open, trading_minutes
+from engine.calendar import session_bounds, session_close, session_open, trading_days, trading_minutes
+from engine.costs import CostFn, ibkr_standard_option_cost
 from engine.data_store import DEFAULT_DATA_DIR, ChainFetchFn, DataProvider, FetchFn
 from engine.entities import DEFAULT_OPTION_MULTIPLIER, Fill, Order
 from engine.fill_engine import Quote, process_pending_orders
@@ -68,6 +64,7 @@ class BacktestResult:
     fills: list[Fill]
     realized_pnl: float
     realized_pnl_events: list  # list[engine.ledger.RealizedPnLEvent], for win-rate/profit-factor reporting
+    multiplier: int = DEFAULT_OPTION_MULTIPLIER  # option contract multiplier used for reporting (notional/turnover)
 
 
 def _build_quotes_for_orders(data: DataProvider, orders: list[Order], ts: datetime) -> dict[str, Quote]:
@@ -89,30 +86,18 @@ def _process_new_orders(
     portfolio: Portfolio,
     open_orders: list[Order],
     ts: datetime,
-    slippage: float,
     session_start: datetime,
     session_end: datetime,
+    cost_fn: Optional[CostFn] = None,
 ) -> None:
     for order in strategy._drain_new_orders():
         if not data.is_warmed(order.contract):
-            # Strategy submitted an order on a contract it never called self.watch() for.
-            # Warm it lazily rather than fail — but this is the less predictable path; prefer
-            # calling self.watch(contract) in initialize() for anything you know about in advance.
-            #
-            # Option contracts get scoped to the window between the day the ORDER was actually
-            # submitted and the contract's OWN expiration date's session close -- not the whole
-            # backtest range (which could span weeks either side of a contract's real trading
-            # window) and not JUST the expiration day's session either. That second mistake is a
-            # real bug this exact line used to have: for a 0DTE contract, entry day == expiration
-            # day, so scoping to "just the expiration day" happened to look correct and every
-            # strategy tested against this engine so far was 0DTE. The first time a genuinely
-            # multi-day position was tried, it broke silently: the order sat with literally no
-            # quote to fill against for every day between submission and expiration (since only
-            # the expiration day's session was ever fetched), then finally filled on the
-            # expiration day's first bar instead -- days late, at a completely different price,
-            # with no error raised to reveal any of this had happened. `compute_gaps` cannot ever
-            # resolve a gap outside a session's actual hours (see its docstring) which is why the
-            # window must be bounded correctly up front, not widened after the fact.
+            # Strategy submitted an order on a contract it never called self.watch() for. Warm it
+            # lazily rather than fail. Option contracts are scoped from the day the ORDER was
+            # submitted through the contract's OWN expiration date's session close -- not the whole
+            # backtest range (which can span weeks either side of a contract's real trading window).
+            # `compute_gaps` cannot ever resolve a gap outside a session's actual hours (see its
+            # docstring), so the window must be bounded correctly up front.
             if order.contract.is_option:
                 warm_start = session_open(order.submitted_at.date())
                 warm_end = session_close(order.contract.expiration)
@@ -122,7 +107,7 @@ def _process_new_orders(
         open_orders.append(order)
 
     quotes = _build_quotes_for_orders(data, open_orders, ts)
-    fills = process_pending_orders(open_orders, quotes, ts, slippage=slippage)
+    fills = process_pending_orders(open_orders, quotes, ts, cost_fn=cost_fn)
     for fill in fills:
         portfolio.apply_fill(fill)
 
@@ -151,13 +136,11 @@ def _settlement_price(data: DataProvider, portfolio: Portfolio, day: date, settl
     The underlying's settlement print for `day`, read from one of the actually-expiring
     positions' own already-fetched bar data — specifically the `underlying_price` column that
     `option_history_greeks_first_order` returns for every row. This needs no additional ThetaData
-    call: that data is already sitting in the position's warmed frame from whatever fetch brought
-    in its option data in the first place. Only used for `settlement_style="cash"`.
+    call. Only used for `settlement_style="cash"`.
 
-    Still subject to the same settlement-timing caveat as before — see `engine/settlement.py`'s
-    docstring on settlement conventions varying by product and expiration cadence. "Most recent
-    tick at or before the settlement instant" is a best-effort proxy if no tick exists exactly at
-    `settlement_time`.
+    Subject to the settlement-timing caveat in `engine/settlement.py` (settlement conventions vary
+    by product and expiration cadence). "Most recent tick at or before the settlement instant" is
+    a best-effort proxy if no tick exists exactly at `settlement_time`.
     """
     settlement_ts = datetime.combine(day, settlement_time)
     expiring_positions = [
@@ -176,23 +159,20 @@ def _force_close_expiring_positions(
     portfolio: Portfolio,
     day: date,
     ts: datetime,
-    slippage: float,
+    cost_fn: Optional[CostFn] = None,
 ) -> None:
     """
     Physical-settlement avoidance (`settlement_style="physical"`): force-closes every open
     position expiring on `day` via an ordinary market order, filled at that contract's own
     bid/ask, during the day's last bar — before the actual exercise/assignment decision would be
-    made (which happens after the close). This converts what would have been a physical
-    settlement into a normal closing trade.
+    made (which happens after the close). Converts what would have been a physical settlement
+    into a normal closing trade.
 
-    Does NOT model early-assignment risk on short American-style positions held on days BEFORE
-    their own expiration — a counterparty could in principle exercise early at any time, which
-    this engine has no visibility into. It only guarantees the engine itself never carries a
-    position through to its own expiration.
+    Does NOT model early-assignment risk on short positions held on earlier days — it only
+    guarantees the engine never carries a position through to its own expiration.
 
-    Raises if any expiring position can't be filled (e.g. no quote available at this exact
-    instant) — silently leaving it open would violate the "never physically settled" guarantee
-    this whole mechanism exists to provide.
+    Raises if any expiring position can't be filled (e.g. no quote at this instant), since
+    silently leaving it open would violate the "never physically settled" guarantee.
     """
     expiring_positions = [
         pos for pos in portfolio.positions.values()
@@ -213,7 +193,7 @@ def _force_close_expiring_positions(
     ]
 
     quotes = _build_quotes_for_orders(data, close_orders, ts)
-    fills = process_pending_orders(close_orders, quotes, ts, slippage=slippage)
+    fills = process_pending_orders(close_orders, quotes, ts, cost_fn=cost_fn)
     for fill in fills:
         portfolio.apply_fill(fill)
 
@@ -231,13 +211,14 @@ def run_backtest(
     start_date: date,
     end_date: date,
     starting_cash: float,
-    slippage: float = 0.0,
     multiplier: int = DEFAULT_OPTION_MULTIPLIER,
     settlement_style: SettlementStyle = "cash",
     settlement_time: time = DEFAULT_CASH_SETTLEMENT_TIME_ET,
     fetch_fn: FetchFn = fetch_from_thetadata,
     chain_fetch_fn: Optional[ChainFetchFn] = fetch_chain_from_thetadata,
     data_dir: Path = DEFAULT_DATA_DIR,
+    cost_fn: Optional[CostFn] = ibkr_standard_option_cost,
+    warm_open_chain: bool = True,
 ) -> BacktestResult:
     session_start = datetime.combine(start_date, time.min)
     session_end = datetime.combine(end_date, time.max)
@@ -256,21 +237,18 @@ def run_backtest(
     for ts in trading_minutes(start_date, end_date):
         if ts.date() != current_day:
             current_day = ts.date()
-            # session_bounds() rebuilds pandas_market_calendars' full schedule -- expensive
-            # (holiday rules, session-day construction). Computing this once per day here, rather
-            # than calling is_last_bar_of_day(ts) on every one of the ~390 bars in the day (which
-            # was recomputing the same schedule from scratch on every single bar), was the actual
-            # dominant cost of a fully-cached run -- not Python itself, not pandas, not I/O.
+            # session_bounds() rebuilds pandas_market_calendars' full schedule (holiday rules,
+            # session-day construction) -- compute once per day, not per bar.
             _, current_day_last_bar = session_bounds(current_day)
             logger.info("Processing %s", current_day)
 
         strategy._set_clock(ts)
         strategy.on_bar(ts)
-        _process_new_orders(strategy, data, portfolio, open_orders, ts, slippage, session_start, session_end)
+        _process_new_orders(strategy, data, portfolio, open_orders, ts, session_start, session_end, cost_fn)
 
         if ts == current_day_last_bar:
             strategy.before_close(ts)
-            _process_new_orders(strategy, data, portfolio, open_orders, ts, slippage, session_start, session_end)
+            _process_new_orders(strategy, data, portfolio, open_orders, ts, session_start, session_end, cost_fn)
 
             day = ts.date()
             if settlement_style == "cash":
@@ -286,16 +264,48 @@ def run_backtest(
                         f"{settlement_time}. Check that contract data covers this date/time."
                     )
             else:  # "physical"
-                _force_close_expiring_positions(data, portfolio, day, ts, slippage)
+                _force_close_expiring_positions(data, portfolio, day, ts, cost_fn)
 
         mid_prices = _mark_to_market_prices(data, portfolio, ts)
         equity = portfolio.mark_to_market(mid_prices)
         equity_rows.append({"timestamp": ts, "cash": portfolio.cash, "equity": equity})
 
+        if ts == current_day_last_bar:
+            # All of today's bars, expiration handling, and mark-to-market are done. Release warm
+            # contract/chain data that can no longer be queried (expired/settled today or earlier),
+            # keeping peak memory near-constant over long windows instead of accumulating one frame
+            # and chain per day. Still-open multi-day positions (data spanning future dates) and
+            # today's/future chains are kept.
+            data.evict_expired(current_day)
+
     equity_curve = pd.DataFrame(equity_rows).set_index("timestamp")
+
+    # Ensure the 0DTE call chain is fetched and persisted for each trading day, so a later
+    # synthetic Monte Carlo (simulation.market_seed) can initialize s0 / V_0 from real data --
+    # even for a strategy that never called get_chain_snapshot(). The warmed chain Parquet IS the
+    # stored data (no separate snapshot file). Skipped if nothing traded, no chain_fetch_fn (e.g.
+    # synthetic runs, which supply their own s0), or warm_open_chain=False.
+    if warm_open_chain and portfolio.positions and chain_fetch_fn is not None:
+        underlying = next(iter(portfolio.positions)).contract.underlying
+        for warm_day in trading_days(start_date, end_date):
+            warm_day = warm_day.date()
+            data.warm_chain(
+                underlying,
+                warm_day,
+                session_open(warm_day),
+                session_close(warm_day),
+                right="call",
+            )
+            # This block exists only to PERSIST each day's chain to disk (for a later
+            # simulation.market_seed to read from Parquet) -- it doesn't need to retain the chain
+            # in memory. Drop it right after persisting so a year-long run doesn't spike ~1-2 GB
+            # of retained chains at the very end.
+            data.evict_expired(warm_day)
+
     return BacktestResult(
         equity_curve=equity_curve,
         fills=portfolio.fills,
         realized_pnl=portfolio.realized_pnl,
         realized_pnl_events=portfolio.realized_pnl_log,
+        multiplier=portfolio.multiplier,
     )

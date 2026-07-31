@@ -4,13 +4,12 @@ log (which doubles as your trade log for later analysis — see reports/report.p
 
 `apply_fill` is the only mutating entry point, used for BOTH ordinary order fills (from
 fill_engine.py) and expiration cash-settlements (from settlement.py) — settlement is modeled as
-"a fill at the intrinsic value," which lets it reuse all the same cost-basis/realized-P&L logic
-instead of duplicating it.
+"a fill at the intrinsic value," reusing the same cost-basis/realized-P&L logic.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 from engine.entities import DEFAULT_OPTION_MULTIPLIER, Contract, Fill, Position
@@ -38,6 +37,7 @@ class Portfolio:
 
     def apply_fill(self, fill: Fill) -> None:
         self.cash -= fill.qty * fill.price * self.multiplier
+        self.cash -= fill.commission  # transaction costs hit cash directly (commission + fees)
         self.fills.append(fill)
 
         existing = self.positions.get(fill.contract.key)
@@ -82,14 +82,9 @@ class Portfolio:
             existing.opened_at = fill.timestamp
 
     def mark_to_market(self, mid_prices: dict[str, float]) -> float:
-        """
-        Total account equity: cash + sum of open positions marked at `mid_prices` (keyed by
+        """Total account equity: cash + sum of open positions marked at `mid_prices` (keyed by
         `Contract.key`, typically (bid+ask)/2 from the current bar). Positions missing from
-        `mid_prices` (e.g. no quote this bar) fall back to their cost basis rather than crashing
-        — this will slightly misstate equity for that bar, which is preferable to halting a
-        backtest over one missing tick; consider logging a warning at the call site if it happens
-        often.
-        """
+        `mid_prices` (e.g. no quote this bar) fall back to their cost basis rather than crashing."""
         equity = self.cash
         for key, pos in self.positions.items():
             price = mid_prices.get(key, pos.avg_price)

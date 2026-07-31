@@ -15,7 +15,8 @@ import math
 from datetime import datetime
 from typing import NamedTuple, Optional
 
-from engine.entities import Contract, Fill, Order
+from engine.costs import CostFn
+from engine.entities import Fill, Order
 
 BUY_SIDES = ("BUY_TO_OPEN", "BUY_TO_CLOSE")
 SELL_SIDES = ("SELL_TO_OPEN", "SELL_TO_CLOSE")
@@ -40,7 +41,7 @@ def process_pending_orders(
     orders: list[Order],
     quotes: dict[str, Quote],
     ts: datetime,
-    slippage: float = 0.0,
+    cost_fn: Optional[CostFn] = None,
 ) -> list[Fill]:
     """
     Attempt to fill every OPEN order against `quotes` (keyed by `Contract.key`) for the current
@@ -48,9 +49,13 @@ def process_pending_orders(
     stay OPEN and are re-checked on the next call with the next bar's quotes.
 
     Mutates matched orders in place (status -> FILLED, fill_price, filled_at) and returns the
-    resulting Fills. `slippage` is a flat per-contract amount applied against the trader
-    (raises effective buy price, lowers effective sell price) — set to 0.0 for a "perfect fill
-    at the touch" assumption, or a few cents for a more conservative fill model.
+    resulting Fills. A MARKET order fills at the touch (bid if selling, ask if buying); a LIMIT
+    order fills at the intersection of the touch and its limit price (i.e. no worse than the
+    limit). There is no slippage model: fills are perfect executions at the book.
+
+    When `cost_fn` is provided, each produced fill carries a `commission` (transaction cost in
+    USD) computed from `cost_fn(side, qty, fill_price)` — the costs module sums this over a
+    fill's contracts and applies per-order minimums. Pass cost_fn=None for free execution.
     """
     fills: list[Fill] = []
 
@@ -65,18 +70,18 @@ def process_pending_orders(
         is_buy = _is_buy(order)
 
         if order.order_type == "MARKET":
-            touch_price = quote.ask if is_buy else quote.bid
+            fill_price = quote.ask if is_buy else quote.bid
         else:  # LIMIT
             if is_buy:
                 if quote.ask > order.limit_price:
                     continue  # market's ask is above what we're willing to pay — not marketable
-                touch_price = min(quote.ask, order.limit_price)
+                fill_price = min(quote.ask, order.limit_price)
             else:
                 if quote.bid < order.limit_price:
                     continue  # market's bid is below what we're willing to accept — not marketable
-                touch_price = max(quote.bid, order.limit_price)
+                fill_price = max(quote.bid, order.limit_price)
 
-        fill_price = touch_price + (slippage if is_buy else -slippage)
+        commission = cost_fn(order.side, order.qty, fill_price) if cost_fn else 0.0
 
         order.status = "FILLED"
         order.fill_price = fill_price
@@ -92,6 +97,7 @@ def process_pending_orders(
                 timestamp=ts,
                 reason="ORDER",
                 group_id=order.group_id,
+                commission=commission,
             )
         )
 

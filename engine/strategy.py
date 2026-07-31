@@ -4,9 +4,7 @@ Base Strategy class.
 Subclass this and override `initialize`, `on_bar`, and optionally `before_close`. Everything
 else here (`get_bars`, `get_greeks`, `get_chain_snapshot`, `submit_order`, `positions`, `cash`,
 `get_datetime`) is the engine-provided surface, wired up by `runner.py`'s `attach()` call before
-the backtest starts — mirrors Lumibot's ergonomics (`self.submit_order(...)`,
-`self.get_last_price(...)`) without any of its threading/scheduling machinery. See the
-architecture guideline, section 8.
+the backtest starts. There is no threading or scheduling machinery.
 
 There is no separate "current underlying price" argument passed into `on_bar` — ThetaData's
 Index/Stock price history requires a subscription tier beyond Options Standard. Use
@@ -83,48 +81,50 @@ class Strategy:
         Full option chain (every listed strike, one side: `right` = "call" or "put") as of the
         most recent available tick at or before now, indexed by strike, with an
         `underlying_price` column. This is the source for both "what's the current underlying
-        price" and "what strikes are listed" — see engine.thetadata_client.fetch_chain_from_thetadata
-        for why this comes from the options chain rather than a separate index feed. Empty
-        DataFrame if there's no data yet (e.g. no listed expiration for that date). Calls and
-        puts are fetched/cached completely independently — call this once per side for a
-        strategy that needs both (e.g. an iron condor).
+        price" and "what strikes are listed" (see engine.thetadata_client.fetch_chain_from_thetadata).
+        Empty DataFrame if there's no data yet (e.g. no listed expiration for that date). Calls
+        and puts are fetched/cached independently — call this once per side for a strategy that
+        needs both (e.g. an iron condor).
         """
         return self._data.chain_snapshot(underlying, expiration, self._current_ts, right)
 
     def get_quote(self, contract: Contract) -> Optional[dict]:
-        """{'bid': ..., 'ask': ...} for `contract` at or before now, or None if unavailable."""
-        row = self._data.bar_at(contract, self._current_ts)
-        if row is None or "bid" not in row.index or "ask" not in row.index:
+        """`{'bid': ..., 'ask': ...}` for `contract` at or before now, or None if unavailable.
+        Uses the numpy-array `quote_at` fast path (see data_store.py) rather than `bar_at`."""
+        result = self._data.quote_at(contract, self._current_ts)
+        if result is None:
             return None
-        return {"bid": row["bid"], "ask": row["ask"]}
+        bid, ask = result
+        return {"bid": bid, "ask": ask}
 
     def submit_order(
         self,
         contract: Contract,
         side: OrderSide,
         qty: int,
-        limit_price: float,
+        limit_price: Optional[float] = None,
+        order_type: OrderType = "LIMIT",
         group_id: Optional[str] = None,
     ) -> Order:
         """
-        Submit a LIMIT order at `limit_price` — you set the price, the engine never guesses one
-        for you. This is the only order type reachable from strategy code: there's no market-
-        order path here, so a strategy can never silently accept an unknown/moving fill price.
+        Submit an order. `order_type` is "LIMIT" (default) or "MARKET".
 
-        The only market orders this engine ever creates are the automatic
-        force-close-before-expiration orders for `settlement_style="physical"` (see
-        `engine.runner._force_close_expiring_positions`) — those bypass this method entirely,
-        since they exist specifically to guarantee a fill and must never risk resting unfilled.
-
-        An unfilled limit order simply stays open and is re-checked against every subsequent
-        bar's bid/ask until it fills (or you cancel it yourself) — there's no automatic
-        cancellation or conversion to market.
+        For LIMIT orders you set the price via `limit_price` and the engine only fills once the
+        market touches it — you are never filled at a price worse than your limit. For MARKET
+        orders `limit_price` must be None and the engine fills at the current touch (ask on a
+        buy, bid on a sell) on the next bar it processes. There is no slippage model: MARKET
+        fills are perfect executions at the book.
         """
+        if order_type not in ("LIMIT", "MARKET"):
+            raise ValueError(f"Unknown order_type {order_type!r} — must be 'LIMIT' or 'MARKET'")
+        if order_type == "LIMIT" and limit_price is None:
+            raise ValueError("LIMIT orders require a limit_price")
+
         order = Order(
             contract=contract,
             side=side,
             qty=qty,
-            order_type="LIMIT",
+            order_type=order_type,
             limit_price=limit_price,
             submitted_at=self._current_ts,
             group_id=group_id,
@@ -142,14 +142,10 @@ class Strategy:
         return self._portfolio.cash
 
     def watch(self, contract: Contract, start: Optional[datetime] = None, end: Optional[datetime] = None) -> None:
-        """
-        Pre-fetch/pre-cache `contract`'s data for [start, end] (defaults to the full backtest
+        """Pre-fetch/pre-cache `contract`'s data for [start, end] (default: the full backtest
         window). Call this from `initialize()` for every contract you know in advance you'll
-        need — it's the difference between one warm-up fetch and (potentially) a fetch triggered
-        mid-loop the first time you submit an order on a contract you never mentioned. The runner
-        will lazily warm any contract you didn't, but pre-declaring is the more predictable path,
-        especially the first time you run against a cold local cache.
-        """
+        need, so its data is fetched once up front rather than lazily mid-loop the first time you
+        submit an order on it."""
         start = start or datetime.combine(self._backtest_start, time.min)
         end = end or datetime.combine(self._backtest_end, time.max)
         self._data.warm(contract, start, end)

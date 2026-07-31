@@ -6,12 +6,11 @@ greeks data. It transparently handles: read local cache -> figure out what's mis
 the missing range -> persist -> return the full requested range.
 
 The actual ThetaData HTTP calls are injected as a `fetch_fn` callback rather than imported directly,
-so this module has zero knowledge of ThetaData's API shape and can be unit-tested with a fake
-fetcher. Wire it up with `engine.thetadata_client.fetch_from_thetadata` in the runner.
+so this module has zero knowledge of ThetaData's API shape. Wire it up with
+`engine.thetadata_client.fetch_from_thetadata` in the runner.
 
 One Parquet file per contract for its entire lifetime (options are short-lived; the underlying
-is a single growing file). This is intentionally simple — if the underlying file ever gets
-unwieldy, revisit monthly partitioning then, not before.
+is a single growing file).
 """
 
 from __future__ import annotations
@@ -69,19 +68,16 @@ def compute_gaps(
     """
     Return the sub-range(s) of [start, end] not covered by `cached`.
 
-    Simple version: only checks the leading and trailing edges of the cached range. It does NOT
-    detect holes in the middle (e.g. a previous partial fetch that skipped a week). That's a
-    deliberate simplification — start here, and only add interior-gap detection if you actually
-    observe stale/missing data slipping through (holidays/weekends are the caller's problem to
-    filter out via the trading calendar, not this function's).
+    Checks only the leading and trailing edges of the cached range; it does NOT detect holes in
+    the middle (a previous partial fetch that skipped a week). Holidays/weekends are the caller's
+    responsibility to filter out via the trading calendar.
 
-    IMPORTANT — callers must request a range the data can actually cover. If `[start, end]`
+    IMPORTANT: callers must request a range the data can actually cover. If `[start, end]`
     extends beyond what will ever exist (e.g. midnight-to-midnight for a feed that only ever has
     regular-trading-hours data), the "gap" at that edge is unsatisfiable: `cached_start`/
     `cached_end` will never move to close it, so every single call will detect the same gap and
-    re-fetch it — forever, on every run, even with a fully "cached" range in every meaningful
-    sense. This is exactly the bug that motivated this warning: see `engine.calendar.session_open`/
-    `session_close` for how callers should scope a warm request to a real session window instead.
+    re-fetch it forever. Callers should scope a warm request to a real session window instead —
+    see `engine.calendar.session_open`/`session_close`.
     """
     if cached.empty:
         return [(start, end)]
@@ -135,15 +131,6 @@ def get_bars(
     return cached.loc[start:end]
 
 
-def cache_status(contract: Contract, data_dir: Path = DEFAULT_DATA_DIR) -> Optional[tuple[datetime, datetime, int]]:
-    """Quick inspection helper: (earliest, latest, row_count) for a contract's cache, or None."""
-    path = local_path_for(contract, data_dir)
-    cached = _load_cache(path)
-    if cached.empty:
-        return None
-    return cached.index.min(), cached.index.max(), len(cached)
-
-
 def _chain_path_for(underlying: str, expiration: date, data_dir: Path = DEFAULT_DATA_DIR, right: str = "call") -> Path:
     # Calls keep the original (pre-multi-right) filename so existing downloaded caches aren't
     # orphaned by this parameter's addition -- only a non-default right gets a suffix.
@@ -166,9 +153,8 @@ def _save_chain_cache(df: pd.DataFrame, path: Path) -> None:
 
 
 def _chain_compute_gaps(cached: pd.DataFrame, start: datetime, end: datetime) -> list[tuple[datetime, datetime]]:
-    """Same idea as `compute_gaps`, but reads the `timestamp` level of a (timestamp, strike)
-    MultiIndex rather than a plain DatetimeIndex — same leading/trailing-edge-only simplification
-    applies (see compute_gaps's docstring)."""
+    """As `compute_gaps`, but reads the `timestamp` level of a (timestamp, strike) MultiIndex
+    rather than a plain DatetimeIndex."""
     if cached.empty:
         return [(start, end)]
 
@@ -229,16 +215,13 @@ def get_chain(
 class DataProvider:
     """
     Thin in-memory layer over `get_bars`/`get_chain`, used by the runner/strategy during the
-    actual backtest loop. Both already do their own Parquet-level caching, but calling them every
-    single minute of the loop would still mean a disk read + gap-check on every call — this class
-    holds one already-loaded DataFrame per contract (and per chain) for the life of a backtest
-    run, so the loop itself never touches disk once warmed.
+    actual backtest loop. Holds one already-loaded DataFrame per contract (and per chain) for the
+    life of a run so the loop never touches disk once warmed.
 
-    Usage: call `warm(contract, start, end)` once per contract before the time loop starts (this
-    is where the one-time Parquet-read-or-ThetaData-fetch cost happens), then use
-    `bar_at`/`bars_up_to` freely inside the loop. `chain_snapshot` is lazier — it warms the whole
-    session for an (underlying, expiration) automatically the first time it's requested, since a
-    strategy typically doesn't know in advance which expiration's chain it'll want.
+    Usage: call `warm(contract, start, end)` once per contract before the time loop starts (the
+    one-time Parquet-read-or-fetch cost happens there), then use `bar_at`/`bars_up_to` freely
+    inside the loop. `chain_snapshot` warms lazily the first time it's requested, since a strategy
+    typically doesn't know in advance which expiration's chain it'll want.
     """
 
     def __init__(self, fetch_fn: FetchFn, data_dir: Path = DEFAULT_DATA_DIR, chain_fetch_fn: Optional[ChainFetchFn] = None):
@@ -253,6 +236,35 @@ class DataProvider:
         self._frames[contract.key] = get_bars(contract, start, end, self.fetch_fn, self.data_dir)
         self._quote_arrays.pop(contract.key, None)  # invalidate any cached fast-path arrays
 
+    def evict_expired(self, cutoff: date) -> None:
+        """
+        Release warm data that can no longer be queried at or after ``cutoff`` (a calendar day).
+        Call once per session day AFTER that day's bars, settlement, and mark-to-market are fully
+        processed, to keep peak memory near-constant over long windows instead of accumulating one
+        frame/chain per day (a full-year 0DTE run otherwise builds up ~1-2 GB of retained chains
+        and frames).
+
+        Safety (works for both 0DTE and multi-day positions):
+          - A contract FRAME is kept while its own data still spans future dates -- a holdover,
+            still-open multi-day position's frame reaches its expiration's session close, which is
+            > ``cutoff``, so it survives. It is dropped once its last data date is ``<= cutoff``
+            (i.e. it has expired/settled today or earlier).
+          - A CHAIN is kept until its expiration day has passed, since ``chain_snapshot`` may still
+            be looked up on the day it's warmed (entry day). Past-expiration chains are never
+            queried again.
+        """
+        today = pd.Timestamp(cutoff)
+
+        # Capture (key, frame) pairs first; the frame is needed to find its last data date.
+        for key, df in [(k, v) for k, v in self._frames.items() if v is not None and not v.empty]:
+            last_date = df.index.max().normalize()
+            if last_date <= today:
+                self._frames.pop(key, None)
+                self._quote_arrays.pop(key, None)
+
+        for key in [key for key in list(self._chains.keys()) if key[1] <= cutoff]:
+            self._chains.pop(key, None)
+
     def bars_up_to(self, contract: Contract, ts: datetime) -> pd.DataFrame:
         """All warmed bars for `contract` at or before `ts`. Empty DataFrame if never warmed.
         For a lookback window (multiple rows) — for a single most-recent row, use `bar_at`
@@ -263,20 +275,11 @@ class DataProvider:
         return df.loc[:ts]
 
     def bar_at(self, contract: Contract, ts: datetime) -> Optional[pd.Series]:
-        """
-        Most recent warmed bar for `contract` at or before `ts`, or None if none exists yet.
-
-        Uses a direct binary-search index lookup (`searchsorted`) rather than routing through
-        `bars_up_to`'s `.loc[:ts]` — this method is called once per open position on EVERY bar of
-        the backtest loop, and `.loc[:ts]` was rebuilding an ever-growing DataFrame slice from
-        scratch on every single call just to take its last row. That was the dominant cost of a
-        fully-cached backtest run once the calendar-recomputation bug (see runner.py) was fixed.
-
-        For just bid/ask (the actual hot path — mark-to-market and fill-matching don't need the
-        rest of the row), use `quote_at` instead: `.iloc[idx]` here still reconstructs a full
-        pandas Series on every call (dtype-inference across the row's columns), which remained
-        the dominant cost even after this method's own O(n)-slice fix.
-        """
+        """Most recent warmed bar for `contract` at or before `ts`, or None if none exists yet.
+        Uses a direct binary-search index lookup (`searchsorted`) rather than `bars_up_to`'s
+        `.loc[:ts]`, since this is called once per open position on every bar of the loop. For
+        just bid/ask (the actual hot path), use `quote_at` instead, which avoids `.iloc[idx]`'s
+        full-Series reconstruction."""
         df = self._frames.get(contract.key)
         if df is None or df.empty:
             return None
@@ -297,13 +300,10 @@ class DataProvider:
         return self._quote_arrays[key]
 
     def quote_at(self, contract: Contract, ts: datetime) -> Optional[tuple[float, float]]:
-        """
-        (bid, ask) for `contract`'s most recent tick at or before `ts`, or None. This is the
-        fast path for the backtest loop's hottest lookups (mark-to-market, order fill-matching):
-        it indexes directly into cached numpy arrays rather than going through pandas' per-row
-        `.iloc[]` (which reconstructs a full typed Series every call — see `bar_at`'s docstring).
-        Use `bar_at`/`get_greeks` instead when you need more than bid/ask.
-        """
+        """`(bid, ask)` for `contract`'s most recent tick at or before `ts`, or None. Fast path
+        for the loop's hottest lookups (mark-to-market, fill-matching): indexes directly into
+        cached numpy arrays rather than pandas' per-row `.iloc[]`. Use `bar_at`/`get_greeks` when
+        you need more than bid/ask."""
         arrays = self._quote_arrays_for(contract)
         if arrays is None:
             return None
@@ -334,28 +334,16 @@ class DataProvider:
         Full option chain (every listed strike, one side: `right` = "call" or "put") as of the
         most recent available tick at or before `ts`, indexed by strike. Lazily warms the window
         from THE DAY THIS IS FIRST CALLED (`ts.date()`) through `expiration`'s session close on
-        first request for a given (underlying, expiration, right) — not just the single instant
-        asked for — so a second call anywhere in that same window (this run, or a future rerun
-        reading from the persisted Parquet cache) doesn't refetch. Empty DataFrame if no
-        `chain_fetch_fn` is configured, or if there's genuinely no data (e.g. no listed expiration
-        that day). Calls and puts are cached and warmed completely independently of each other —
-        a strategy that needs both (e.g. an iron condor) calls this twice, once per side.
+        first request for a given (underlying, expiration, right), so a second call anywhere in
+        that window (this run, or a rerun reading the persisted Parquet cache) doesn't refetch.
+        Empty DataFrame if no `chain_fetch_fn` is configured, or there's genuinely no data (e.g.
+        no listed expiration that day). Calls and puts are cached and warmed completely
+        independently — a strategy that needs both (e.g. an iron condor) calls this twice, once
+        per side.
 
-        IMPORTANT: warming from `ts.date()` rather than `expiration` is deliberate, not
-        incidental — for a 0DTE call this is the same date either way, but a strategy that wants
-        TODAY's chain for an option expiring days from now (e.g. to pick delta-targeted strikes
-        for a new position, or to check strikes ahead of a roll) needs data available STARTING
-        FROM TODAY, not starting from the expiration date. Warming `[session_open(expiration),
-        session_close(expiration)]` unconditionally — this method's original implementation —
-        meant every timestamp in the cache was on the expiration date, so a lookup on any earlier
-        day always fell before the entire cached range and silently returned empty, no error.
-        Same bug class as the one `engine.runner`'s per-contract lazy-warm had; see its docstring.
-
-        Scoped to actual market sessions (open -> close), NOT full calendar days — requesting
-        midnight-to-midnight would include hours no option ever has data for, which
-        `_chain_compute_gaps` can never resolve (see its docstring): it would silently re-fetch
-        that same unsatisfiable pre-/post-market range on every single call, forever, since no
-        data will ever exist there to close the gap.
+        Warming is scoped to actual market sessions (open -> close), NOT full calendar days —
+        requesting midnight-to-midnight would include hours no option ever has data for, which
+        `_chain_compute_gaps` can never resolve and would re-fetch forever.
         """
         key = (underlying, expiration, right)
         if key not in self._chains:

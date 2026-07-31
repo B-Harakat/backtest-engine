@@ -32,6 +32,16 @@ logger = logging.getLogger(__name__)
 
 ENTRY_TIME = time(10, 30)
 
+# Monte Carlo grid spec (consumed generically by simulation.monte_carlo.expand_grid; run_mc
+# loads it by importing this module via the --strategy spec). Sparse: only the params listed
+# here are varied across the Cartesian product; every other constructor arg keeps its default
+# (partial override). ``entry_time`` is a constructor param, see __init__.
+GRID = {
+    "spread_width": [2, 3],
+    "short_leg_stop_multiple": [1.5, 3.0],
+    "entry_time": [time(10, 0), time(11, 0)],
+}
+
 
 class VerticalSpreadStrategy(Strategy):
     def __init__(
@@ -40,9 +50,11 @@ class VerticalSpreadStrategy(Strategy):
         quantity: int = 1,
         spread_width: int = 2,  # how many listed strikes further out the short leg is
         short_leg_stop_multiple: float = 2.0,  # buy back the short leg alone if its cost doubles
+        entry_time: time = ENTRY_TIME,  # intraday time (ET) to enter the spread each session
     ):
         super().__init__()
         self.underlying = underlying
+        self.entry_time = entry_time
         self.quantity = quantity
         self.spread_width = spread_width
         self.short_leg_stop_multiple = short_leg_stop_multiple
@@ -68,7 +80,7 @@ class VerticalSpreadStrategy(Strategy):
             self.get_chain_snapshot(self.underlying, ts.date())
             self._warmed_chain_on = ts.date()
 
-        if ts.time() == ENTRY_TIME and self._entered_on != ts.date():
+        if ts.time() == self.entry_time and self._entered_on != ts.date():
             self._enter_spread(ts)
 
         if self._short_leg is not None and not self._short_leg_closed:
@@ -117,13 +129,9 @@ class VerticalSpreadStrategy(Strategy):
         )
 
     def _check_short_leg_stop(self, ts: datetime) -> None:
-        """
-        Independent leg management -- this is the part of the strategy specifically meant to
-        exercise "close one leg of a multi-leg position independently of the other." If the short
-        leg's cost to buy back has risen past `short_leg_stop_multiple` times the credit
-        collected for it, close JUST that leg; the long leg is left completely alone and keeps
-        riding toward its own settlement regardless of what happens here.
-        """
+        """Independent leg management: if the short leg's cost to buy back has risen past
+        `short_leg_stop_multiple` times the credit collected for it, close JUST that leg; the
+        long leg is left alone and keeps riding toward its own settlement."""
         quote = self.get_quote(self._short_leg)
         if quote is None:
             return  # no data yet this bar -- try again next bar

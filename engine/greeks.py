@@ -1,49 +1,33 @@
 """
-Second-order greeks, computed in Python from the implied vol ThetaData already gives us —
-NOT re-derived independently. Using their IV (rather than fitting our own) is what keeps these
-numbers consistent with the 1st-order greeks you're paying for on the Standard plan.
+Second-order greeks, computed in Python from the implied vol ThetaData already gives us — NOT
+re-derived independently. Using their IV keeps these consistent with the 1st-order greeks the
+Options Standard plan provides.
 
-Model conventions matched to ThetaData's stated methodology (see their "Option Greeks" article):
-  - Black-Scholes, European exercise (correct for cash-settled index products like XSP/SPX
-    weeklies/RUT/NDX/VIX; NOT correct for American-style equity/ETF options — this engine never
-    simulates physical settlement for those at all, see engine.runner's force-close mechanism,
-    so European-style Greeks are used uniformly regardless of the underlying's real-world style)
-  - dividend yield q = 0 by default (ThetaData ignores dividends unless you pass annual_div)
-  - no external deps beyond stdlib — normal pdf/cdf via math.erf, not scipy
+Model conventions matched to ThetaData's methodology (Black-Scholes, European exercise, correct
+for cash-settled index products like XSP/SPX weeklies/RUT/NDX/VIX; not correct for American-style
+equity/ETF options, but this engine never simulates physical settlement for those). Dividend
+yield q = 0 by default; no external deps beyond stdlib (normal pdf/cdf via math.erf).
 
-One thing ThetaData's docs call out explicitly: their returned `rho` and `vega` values must be
-divided by 100 to reach the standard per-unit convention. Gamma/vanna/charm below are computed
-in the same standard per-unit convention as a result — see NOTE_ON_UNITS below before comparing
-against a different provider or a spreadsheet model.
-
-NOTE_ON_UNITS:
-    delta:  d(price)/d(underlying), no scaling
-    gamma:  d(delta)/d(underlying), no scaling
-    vanna:  d(delta)/d(vol), where vol is in decimal (0.20 = 20%) — divide by 100 if you want
-            "per 1 vol point" to match how ThetaData scales vega
-    charm:  d(delta)/d(time), in "per year" units — divide by 365 for "per day" decay, which is
-            usually the more intuitive unit to look at for 0DTE/short-dated contracts
+Units (all standard per-unit conventions):
+    delta:  d(price)/d(underlying)
+    gamma:  d(delta)/d(underlying)
+    vanna:  d(delta)/d(vol), vol in decimal (0.20 = 20%)
+    charm:  d(delta)/d(time), in "per year" units (divide by 365 for per-day decay)
+ThetaData's returned `rho`/`vega` are divided by 100 to reach these standard units (done once in
+`engine.thetadata_client`); gamma/vanna/charm here are already standard per-unit.
 
 Risk-free rate:
-    ThetaData defaults to SOFR (a few percent, not 0) unless you pass `rate_value` explicitly on
-    the request. Rather than guess at their SOFR value and hope it roughly matches this module's
-    `r=0.0` default, `engine.thetadata_client` explicitly passes `rate_value=0.0` (see its
-    `ASSUMED_RATE_PCT` constant) on every greeks request — forcing BOTH their 1st-order greeks
-    and this module's 2nd-order greeks to use the exact same r, guaranteeing consistency instead
-    of hoping for it. Change `ASSUMED_RATE_PCT` there (and the default here) together if you want
-    a nonzero rate — for short-dated contracts the simplification barely matters either way.
+    `engine.thetadata_client` passes `rate_value=0.0` (its `ASSUMED_RATE_PCT`) on every greeks
+    request, and this module computes with `r=0.0`, keeping both sides on the same rate. Change
+    them together if you want a nonzero rate — for short-dated contracts it barely matters.
 
-Time-to-expiration, and a consistency wrinkle for 0DTE:
-    ThetaData's default ("latest") greeks methodology computes TTE from the actual quote
-    timestamp for contracts under 7 DTE (real elapsed time, same idea as
-    `time_to_expiry_years` below), and a whole-number DTE beyond that. Their API reference also
-    notes "latest" floors at a minimum of ~1 hour for same-day expirations specifically (to avoid
-    the numerical blowup of T→0 in Black-Scholes). This module's `time_to_expiry_years` does NOT
-    apply that floor by default — for a 0DTE contract in its final hour, our IV-derived
-    gamma/vanna/charm will therefore very slightly diverge from what's internally consistent with
-    ThetaData's own delta/theta/vega in that last hour. This is a minor, bounded effect (it only
-    matters in the closing minutes of expiration day), but worth knowing about if you see anything
-    odd in gamma right at the end of a 0DTE session.
+Time-to-expiration, 0DTE wrinkle:
+    ThetaData's "latest" methodology computes TTE from the actual quote timestamp for contracts
+    under 7 DTE (real elapsed time, same as `time_to_expiry_years` here) and floors same-day
+    expirations at ~1 hour to avoid the T→0 blowup in Black-Scholes. `time_to_expiry_years` below
+    does NOT apply that floor, so in the final hour of a 0DTE session the IV-derived
+    gamma/vanna/charm can very slightly diverge from ThetaData's own delta/theta/vega. Minor and
+    bounded; only matters in the closing minutes of expiration day.
 """
 
 from __future__ import annotations
@@ -55,11 +39,9 @@ from typing import Literal
 
 Right = Literal["CALL", "PUT"]
 
-# Default settlement cutoff for computing time-to-expiration, used unless overridden.
-# XSP and SPX weeklies/0DTE are PM-settled against the normal 4:00pm ET close, but this varies by
-# product AND by expiration cadence (SPX's standard monthly expirations are AM-settled against a
-# special print) — VERIFY this against current OCC/Cboe specs for whatever you actually trade,
-# and override via run_backtest's `settlement_time` parameter rather than editing this default.
+# Default settlement cutoff for computing time-to-expiration. XSP and SPX weeklies/0DTE are
+# PM-settled against the 4:00pm ET close, but this can vary by product/expiration cadence (SPX
+# standard monthlies are AM-settled) — override via run_backtest's `settlement_time` if needed.
 DEFAULT_CASH_SETTLEMENT_TIME_ET = time(16, 0)
 
 
@@ -98,9 +80,8 @@ def compute_second_order_greeks(
     q: float = 0.0,
 ) -> SecondOrderGreeks:
     """
-    Black-Scholes gamma, vanna, charm. `right` only affects charm (via the dividend term) — with
-    q=0 (ThetaData's default), charm is numerically identical for calls and puts, which is a
-    useful sanity check if you ever see them diverge with q=0 still set.
+    Black-Scholes gamma, vanna, charm. `right` only affects charm (via the dividend term); with
+    q=0 (ThetaData's default), charm is numerically identical for calls and puts.
     """
     S, K, T, sigma = underlying_price, strike, time_to_expiry_yrs, implied_vol
 

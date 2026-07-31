@@ -1,9 +1,8 @@
 creds.txt
 .env
 data/
-backtest_results/
 output/
 lib/
 __pycache__/
 *.pyc
-*.toml
+

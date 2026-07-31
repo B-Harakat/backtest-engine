@@ -26,12 +26,14 @@ from pathlib import Path
 # (e.g. `python scripts/run_backtest.py`) rather than as an installed package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from engine.costs import cost_model_from_name
 from engine.data_store import DEFAULT_DATA_DIR
 from engine.entities import DEFAULT_OPTION_MULTIPLIER
 from engine.greeks import DEFAULT_CASH_SETTLEMENT_TIME_ET
 from engine.runner import run_backtest
 from engine.thetadata_client import fetch_from_thetadata
-from reports.report import print_summary, save_report
+from reports.output import write_history
+from reports.report import print_summary
 
 
 def load_strategy_class(spec: str):
@@ -56,7 +58,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--start", required=True, help="YYYY-MM-DD")
     parser.add_argument("--end", required=True, help="YYYY-MM-DD")
     parser.add_argument("--cash", type=float, default=10_000.0, help="Starting cash (default: 10000)")
-    parser.add_argument("--slippage", type=float, default=0.0, help="Flat per-contract slippage (default: 0.0)")
     parser.add_argument(
         "--multiplier", type=int, default=DEFAULT_OPTION_MULTIPLIER,
         help=f"Contract multiplier, $ per point per contract (default: {DEFAULT_OPTION_MULTIPLIER})",
@@ -74,7 +75,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              f"(default: {DEFAULT_CASH_SETTLEMENT_TIME_ET.strftime('%H:%M')})",
     )
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="Local Parquet cache directory")
-    parser.add_argument("--output-dir", default="backtest_results", help="Where to write reports")
+    parser.add_argument("--output-dir", default="output", help="Root output dir (default: output/)")
+    parser.add_argument(
+        "--cost-model", default="ibkr",
+        help="Transaction-cost model applied to every order fill: 'ibkr' (IBKR Standard/"
+             "Pro tiered U.S. options pricing, default) or 'none' for free execution",
+    )
     parser.add_argument("--debug", action="store_true", help="Verbose logging: shows every cache-gap fetch and how long it took")
     return parser.parse_args(argv)
 
@@ -107,22 +113,29 @@ def main(argv: list[str] | None = None) -> dict:
     end_date = datetime.strptime(args.end, "%Y-%m-%d").date()
     settlement_time = datetime.strptime(args.settlement_time, "%H:%M").time()
 
+    cost_fn = cost_model_from_name(args.cost_model)
+
     result = run_backtest(
         strategy,
         start_date,
         end_date,
         starting_cash=args.cash,
-        slippage=args.slippage,
         multiplier=args.multiplier,
         settlement_style=args.settlement_style,
         settlement_time=settlement_time,
         fetch_fn=fetch_from_thetadata,
         data_dir=Path(args.data_dir),
+        cost_fn=cost_fn,
     )
 
-    summary = save_report(result, starting_cash=args.cash, output_dir=Path(args.output_dir))
+    summary = write_history(
+        strategy_cls,
+        result,
+        starting_cash=args.cash,
+        output_root=Path(args.output_dir),
+    )
     print_summary(summary)
-    print(f"\nReports written to: {Path(args.output_dir).resolve()}")
+    print(f"\nHISTORY written to: {(Path(args.output_dir) / strategy_cls.__name__.upper() / 'HISTORY').resolve()}")
     return summary
 
 

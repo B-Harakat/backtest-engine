@@ -2,20 +2,14 @@
 Expiration handling for cash-settled, European-style options (the settlement mechanics used by
 index products like XSP, SPX weeklies/0DTE, RUT, NDX, VIX).
 
-Adapted from the pattern in Lumibot's `backtesting_broker.py`
-(`settle_expired_option_contract` / `cash_settle_options_contract` / `_intrinsic_value_per_contract`),
-stripped of the equity-option branches (assignment/exercise/early-assignment) that don't apply to
-a cash-settled index product.
-
 Settlement is modeled as a Fill at the contract's intrinsic value, applied through the same
 `Portfolio.apply_fill` used for ordinary trades — see ledger.py's docstring for why.
 
 This module only implements the CASH-settlement path. For underlyings whose real-world options
 are physically settled (American-style equity/ETF options), this engine never simulates physical
-settlement at all — see `engine.runner`'s `_force_close_expiring_positions`, which force-closes
-any such position via an ordinary market order before its own expiration instead. Which path a
-backtest run uses is chosen once via `run_backtest`'s `settlement_style` parameter, not per
-contract (this engine assumes a single underlying per run — see the architecture guideline).
+settlement at all — see `engine.runner`'s `_force_close_expiring_positions`. Which path a run uses
+is chosen once via `run_backtest`'s `settlement_style` parameter, not per contract (this engine
+assumes a single underlying per run).
 """
 
 from __future__ import annotations
@@ -44,20 +38,16 @@ def expire_and_settle(
     """
     Cash-settle every open position expiring on `as_of_date` at `underlying_settlement_price`.
 
-    IMPORTANT: `underlying_settlement_price` must be the actual official settlement print for
-    the contract's expiration cadence — NOT just "the last minute bar's close." Settlement timing
-    and price source vary by product AND by expiration cadence within the same product: XSP and
-    SPX's weekly/0DTE expirations are PM-settled against the normal 4:00pm ET close, but SPX's
-    *standard monthly* expirations are AM-settled against a special opening print the next
-    morning — verify this against current OCC/Cboe specs for whichever underlying and expiration
-    cadence you're actually trading; passing the wrong settlement price/time here silently
-    corrupts expiration P&L. `settlement_time` (threaded from `run_backtest`'s
-    `settlement_time` parameter) only controls the Fill's recorded timestamp — the actual price
-    source verification is on you.
+    IMPORTANT: `underlying_settlement_price` must be the actual official settlement print for the
+    contract's expiration cadence — NOT just "the last minute bar's close." Settlement timing and
+    price source vary by product AND by expiration cadence within the same product (e.g. XSP and
+    SPX weeklies/0DTE are PM-settled against the 4:00pm ET close, while SPX standard monthlies are
+    AM-settled against a special opening print). Verify against current OCC/Cboe specs; passing
+    the wrong price/time silently corrupts expiration P&L. `settlement_time` only controls the
+    Fill's recorded timestamp.
 
     Out-of-the-money contracts settle at zero — they still produce a Fill (reason=
-    "EXPIRY_CASH_SETTLEMENT", price=0.0) so the trade log shows the position expiring worthless
-    rather than silently vanishing.
+    "EXPIRY_CASH_SETTLEMENT", price=0.0) so the trade log shows the position expiring worthless.
     """
     settlement_ts = datetime.combine(as_of_date, settlement_time)
     settlement_fills: list[Fill] = []

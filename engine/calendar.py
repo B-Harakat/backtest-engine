@@ -2,10 +2,7 @@
 Trading calendar helpers — the master clock the time loop iterates over.
 
 Uses `pandas_market_calendars` for the actual XNYS holiday/early-close schedule rather than
-hand-rolling one — that library already correctly encodes things like Thanksgiving, the day
-after Thanksgiving's early close, Christmas Eve early closes in years it applies, etc. Don't
-reinvent this; getting a holiday calendar subtly wrong is a classic source of silent backtest
-bugs (phantom trading days, or missing an early-close flatten).
+hand-rolling one, so things like Thanksgiving and its early close are encoded correctly.
 
 Timestamp convention: naive wall-clock America/New_York, matching `engine.thetadata_client`.
 """
@@ -63,14 +60,13 @@ def session_open(day: date) -> datetime:
 
 def session_close(day: date) -> datetime:
     """
-    The actual market close instant for `day` — unlike `session_bounds`'s `last_bar`, this is
-    NOT shifted back a minute for the bar-start convention. Respects early closes.
+    The actual market close instant for `day` — unlike `session_bounds`'s `last_bar`, this is NOT
+    shifted back a minute for the bar-start convention. Respects early closes.
 
     Use this (paired with `session_open`) when you need the true [open, close] window a session's
-    data can ever cover — e.g. when warming a contract's or chain's full-day cache. Requesting a
-    wider window (like the full calendar day) will make `data_store.compute_gaps`/
-    `_chain_compute_gaps` see a permanent, unsatisfiable "gap" outside trading hours and re-fetch
-    it on every single call, forever, since no data will ever exist there to close that gap.
+    data can cover — e.g. when warming a contract's or chain's full-day cache. Requesting a wider
+    window (like the full calendar day) makes `data_store.compute_gaps`/`_chain_compute_gaps` see
+    a permanent, unsatisfiable gap outside trading hours and re-fetch forever.
     """
     _, close_ts = _session_open_close(day)
     return close_ts.to_pydatetime()
@@ -87,9 +83,3 @@ def trading_minutes(start: date, end: date) -> Iterator[datetime]:
         while ts <= last_bar:
             yield ts
             ts += pd.Timedelta(minutes=1)
-
-
-def is_last_bar_of_day(ts: datetime, day: date | None = None) -> bool:
-    """True if `ts` is the final minute bar of its session (respects early closes)."""
-    _, last_bar = session_bounds(day if day is not None else ts.date())
-    return ts == last_bar

@@ -1,23 +1,21 @@
 """
-ThetaData client — rewritten for the `thetadata` Python library (gRPC-based, authenticates over
-HTTPS; no ThetaTerminal process to run). See https://docs.thetadata.us/Python-Library/Getting-Started.html
+ThetaData client, built on the `thetadata` Python library (gRPC-based, authenticates over HTTPS;
+no ThetaTerminal process to run). See https://docs.thetadata.us/Python-Library/Getting-Started.html
 
 Scoped to what an Options Standard subscription actually has access to: OHLC bars and
 first-order greeks (delta, theta, vega, rho, epsilon, lambda, implied_vol) — NOT second-order
-(gamma) or third-order greeks, which need a higher tier. That's exactly why `engine.greeks`
-exists: it computes gamma/vanna/charm locally from the implied_vol this tier does give us.
+(gamma) or third-order greeks, which need a higher tier. That's why `engine.greeks` exists: it
+computes gamma/vanna/charm locally from the implied_vol this tier does give us.
 
 Only two ThetaData calls per contract-date-range: `option_history_ohlc` and
-`option_history_greeks_first_order`. The greeks endpoint already returns the NBBO bid/ask used
-in its own calculation, so a separate quote call isn't needed — this is a real simplification
-over the earlier REST/ThetaTerminal design, which needed three calls per contract.
+`option_history_greeks_first_order`. The greeks endpoint already returns the NBBO bid/ask used in
+its own calculation, so no separate quote call is needed.
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
@@ -28,12 +26,9 @@ DEFAULT_INTERVAL = "1m"
 ET = "America/New_York"
 
 # Passed to BOTH ThetaData's `rate_value` param below AND `engine.greeks.compute_second_order_greeks`'s
-# `r` argument (that module's default is also 0.0 — keep the two in sync if you change this).
-# ThetaData defaults to SOFR (a few percent, not 0) if `rate_value` is left unset; letting them
-# use their SOFR default while we assumed r=0 locally would silently make our gamma/vanna/charm
-# inconsistent with their delta/theta/vega/rho. Forcing both sides to the same explicit value
-# removes that ambiguity entirely, at the cost of a small (and for short-dated XSP, negligible)
-# realism trade-off versus using the true SOFR rate.
+# `r` argument, keeping both sides on the same explicit r (ThetaData would otherwise default to
+# SOFR, silently diverging from this module's r=0 assumption). Change `ASSUMED_RATE_PCT` here and
+# the default in engine.greeks together if you want a nonzero rate.
 ASSUMED_RATE_PCT = 0.0
 
 # ThetaData already ignores dividends by default (matches engine.greeks's q=0 default) — passed
@@ -88,14 +83,10 @@ def _right_str(contract: Contract) -> str:
 
 def _ensure_naive_et(df: pd.DataFrame) -> pd.DataFrame:
     """
-    The rest of the engine standardizes on naive wall-clock America/New_York timestamps (see
-    calendar.py's module docstring). The Python library's docs don't explicitly state whether
-    the returned `timestamp` column is tz-aware or already naive-local — handle both: convert to
-    ET and strip tz info if aware, pass through unchanged if already naive. VERIFY this against
-    the first real response you get back; if timestamps come back looking shifted by a fixed
-    number of hours against what you expect (e.g. bars starting at 14:30 instead of 09:30), the
-    library is returning naive UTC rather than naive ET and this function needs a `tz_localize
-    ("UTC").tz_convert(ET).tz_localize(None)` path added instead.
+    The engine standardizes on naive wall-clock America/New_York timestamps (see
+    calendar.py's module docstring). The `thetadata` library's returned `timestamp` column may be
+    tz-aware or already naive-local — convert to ET and strip tz info if aware, pass through
+    unchanged if already naive.
     """
     if df.empty or not isinstance(df.index, pd.DatetimeIndex):
         return df
@@ -131,13 +122,10 @@ def _fetch_or_empty(fn, **kwargs) -> pd.DataFrame:
     """
     Calls a ThetaData client method, returning an empty DataFrame instead of letting
     `NoDataFoundError` propagate. A contract can legitimately have zero trades (OHLC) or zero
-    quotes (greeks) for an otherwise-correctly-scoped request -- e.g. a thin, far-out-of-the-money
-    strike that's listed and has occasional bid/ask activity but never actually printed a trade
-    on a given day. That's a real, valid data state, not an error, and shouldn't crash a backtest;
-    it should just mean this particular bar/gap has nothing to contribute. This is a different
-    case from the earlier "requested a date range the contract can never have data for at all"
-    bug (e.g. asking for a contract's OHLC weeks after it expired) -- that one is a genuine
-    caller mistake worth surfacing; this one is normal, expected market microstructure.
+    quotes (greeks) for an otherwise-correctly-scoped request — e.g. a thin, far-out-of-the-money
+    strike that's listed but never printed a trade on a given day. That's a valid data state, not
+    an error, and shouldn't crash a backtest; it should just mean this bar/gap has nothing to
+    contribute.
     """
     from thetadata.errors import NoDataFoundError
 
@@ -277,14 +265,12 @@ def fetch_chain_from_thetadata(
     (every listed strike, one side at a time) for `underlying`'s `expiration`, covering
     [gap_start, gap_end], via `option_history_greeks_first_order(strike="*")`.
 
-    This is how the engine sources both "what's the underlying price right now" and "what
-    strikes are actually listed" using only an Options Standard subscription — every row already
-    carries `underlying_price`, and the set of `strike` values present at each tick IS the listed
-    strike list, with no separate Index/Stock-tier endpoint (`index_history_price`) or
-    listing-tier endpoint (`option_list_strikes`) required. `right` is `"call"` or `"put"` — one
-    side per call, since a single (timestamp, strike) MultiIndex can't hold both a call and a put
-    row at the same strike; call this once per side for a strategy that needs both (e.g. an iron
-    condor), which is exactly what `Strategy.get_chain_snapshot(..., right=...)` does.
+    This is how the engine sources both "what's the underlying price right now" and "what strikes
+    are actually listed" using only an Options Standard subscription: every row already carries
+    `underlying_price`, and the set of strike values present at each tick IS the listed strike
+    list, so no separate Index/Stock-tier or listing-tier endpoint is needed. `right` is `"call"`
+    or `"put"` — one side per call, since a single (timestamp, strike) MultiIndex can't hold both
+    a call and a put row at the same strike.
 
     Returns a DataFrame with a (timestamp, strike) MultiIndex.
     """
