@@ -16,7 +16,7 @@ Naming/meaning:
     `BatesParams.V_0` takes VARIANCE, so `V_0 = iv**2`.
 
 Expected cache layout (see `engine.data_store`):
-    `data_dir/chains/{underlying}_{day:YYYYMMDD}_chain.parquet` (call side), a
+    `data_dir/chains/{underlying}_{day:YYYYMMDD}_call_chain.parquet` (call side), a
     (timestamp, strike) MultiIndex with `underlying_price` and `implied_vol` columns.
 
 Raises with a clear error if the cache is absent or contains no valid opening quote.
@@ -62,8 +62,7 @@ def opening_market_from_cache(
     max_minutes: int = MAX_OPEN_MINUTES,
 ) -> OpeningMarket:
     """Read the opening spot/ATM-IV seeds for ``day`` from the real cached 0DTE chain."""
-    # Use the copy of _chain_path_for in the same module (call-side default right="call"); the
-    # "call" chain is the one that carries the full strike set + underlying_price we want.
+    # The "call" chain is the one that carries the full strike set + underlying_price we want.
     path = _chain_path_for(underlying, day, data_dir, right="call")
     if not path.exists():
         raise FileNotFoundError(

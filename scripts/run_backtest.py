@@ -133,9 +133,10 @@ def main(argv: list[str] | None = None) -> dict:
         result,
         starting_cash=args.cash,
         output_root=Path(args.output_dir),
+        ticker=strategy.underlying,
     )
     print_summary(summary)
-    print(f"\nHISTORY written to: {(Path(args.output_dir) / strategy_cls.__name__.upper() / 'HISTORY').resolve()}")
+    print(f"\nHISTORY written to: {(Path(args.output_dir) / strategy.underlying / strategy_cls.__name__ / 'HISTORY').resolve()}")
     return summary
 
 

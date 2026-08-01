@@ -1,16 +1,16 @@
 """
 Run-output writers: persistently tree-based run/monte-carlo reports under ``output/``.
 
-Layout (strategy class name UPPERCASED):
+Layout (category = underlying/ticker, then strategy class name):
 
-    output/<STRATEGY>/HISTORY/             -- one backtest run; files overwrite per run
-        trade_log.csv                       fills (incl. expiration settlements)
-        cash_equity.csv                     daily granularity: one row per trading day
-        summary.json                        build_summary() statistics
+    output/<ticker>/<strategy>/HISTORY/       -- one backtest run; files overwrite per run
+        trade_log.csv                           fills (incl. expiration settlements)
+        cash_equity.csv                         daily granularity: one row per trading day
+        summary.json                            build_summary() statistics
 
-    output/<STRATEGY>/MONTE-CARLO/         -- one synthetic Monte-Carlo experiment
-        <date>.csv                          per day; rows = stats, columns = one per param set
-        _summary.csv                        rollup: each stat averaged across days per param set
+    output/<ticker>/<strategy>/MONTE-CARLO/   -- one synthetic Monte-Carlo experiment
+        <date>.csv                              per day; rows = stats, columns = one per param set
+        _summary.csv                            rollup: each stat averaged across days per param set
 
 The HISTORY files reuse ``reports.report`` primitives (``build_summary``, ``fills_to_dataframe``);
 the MONTE-CARLO stats are the same ``build_summary`` statistics, but gathered per path and pooled
@@ -35,8 +35,8 @@ if TYPE_CHECKING:
     from simulation.monte_carlo import PathResult
 
 
-def _strategy_dir(output_root: Path, strategy_cls: type) -> Path:
-    return output_root / strategy_cls.__name__.upper()
+def _strategy_dir(output_root: Path, strategy_cls: type, ticker: str) -> Path:
+    return output_root / ticker / strategy_cls.__name__
 
 
 def daily_equity_frame(result: "BacktestResult") -> pd.DataFrame:
@@ -57,10 +57,11 @@ def write_history(
     result: "BacktestResult",
     starting_cash: float,
     output_root: Path,
+    ticker: str,
 ) -> dict:
     """Write trade_log.csv, cash_equity.csv and summary.json under
-    ``output/<STRATEGY>/HISTORY/``. Returns `build_summary()`'s summary dict."""
-    out = _strategy_dir(output_root, strategy_cls) / "HISTORY"
+    ``output/<ticker>/<strategy>/HISTORY/``. Returns `build_summary()`'s summary dict."""
+    out = _strategy_dir(output_root, strategy_cls, ticker) / "HISTORY"
     out.mkdir(parents=True, exist_ok=True)
 
     fills_to_dataframe(result.fills).to_csv(out / "trade_log.csv", index=False)
@@ -156,13 +157,26 @@ def write_monte_carlo(
     strategy_cls: type,
     results: list["PathResult"],
     output_root: Path,
+    ticker: str,
 ) -> None:
     """
-    Write output/<STRATEGY>/MONTE-CARLO/<date>.csv per day (columns = param sets, rows = pooled
-    stats) and _summary.csv (each stat averaged across days per param set).
+    Write output/<ticker>/<STRATEGY>/MONTE-CARLO/<date>.csv per day (columns = param sets, rows =
+    pooled stats) and _summary.csv (each stat averaged across days per param set).
+
+    The MONTE-CARLO folder is wiped of ALL its .csv files before writing, so a run leaves only
+    the per-day files and _summary.csv belonging to its own date range. Stale per-day <date>.csv
+    files from a previous run over different dates are otherwise left behind (each run writes
+    only its own days and never cleared the folder), which accumulates misleading orphaned files
+    mixing unrelated experiments.
     """
-    out = _strategy_dir(output_root, strategy_cls) / "MONTE-CARLO"
+    out = _strategy_dir(output_root, strategy_cls, ticker) / "MONTE-CARLO"
     out.mkdir(parents=True, exist_ok=True)
+
+    # Clear the last run's outputs before writing this run's, so no stale files from an older
+    # date range linger in the folder. Everything below (per-day CSVs + _summary.csv) is fully
+    # recreated from `results`, so nothing of the prior run is lost that matters.
+    for stale in out.glob("*.csv"):
+        stale.unlink()
 
     # Group results by day for per-day files.
     by_day: dict[date, list[PathResult]] = {}

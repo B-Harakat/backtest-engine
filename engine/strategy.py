@@ -76,15 +76,16 @@ class Strategy:
             return None
         return {col: row[col] for col in _GREEK_COLUMNS if col in row.index}
 
-    def get_chain_snapshot(self, underlying: str, expiration: date, right: str = "call") -> pd.DataFrame:
+    def get_chain_snapshot(self, underlying: str, expiration: date, right: str) -> pd.DataFrame:
         """
         Full option chain (every listed strike, one side: `right` = "call" or "put") as of the
         most recent available tick at or before now, indexed by strike, with an
         `underlying_price` column. This is the source for both "what's the current underlying
         price" and "what strikes are listed" (see engine.thetadata_client.fetch_chain_from_thetadata).
-        Empty DataFrame if there's no data yet (e.g. no listed expiration for that date). Calls
-        and puts are fetched/cached independently — call this once per side for a strategy that
-        needs both (e.g. an iron condor).
+        Empty DataFrame if there's no data yet (e.g. no listed expiration for that date). The
+        chain is always single-sided, so `right` is REQUIRED — pass "call" OR "put" explicitly;
+        there is no default side. Calls and puts are fetched/cached independently — call this
+        once per side for a strategy that needs both (e.g. an iron condor).
         """
         return self._data.chain_snapshot(underlying, expiration, self._current_ts, right)
 

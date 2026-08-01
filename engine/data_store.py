@@ -132,10 +132,11 @@ def get_bars(
 
 
 def _chain_path_for(underlying: str, expiration: date, data_dir: Path = DEFAULT_DATA_DIR, right: str = "call") -> Path:
-    # Calls keep the original (pre-multi-right) filename so existing downloaded caches aren't
-    # orphaned by this parameter's addition -- only a non-default right gets a suffix.
-    suffix = "" if right == "call" else f"_{right}"
-    return data_dir / "chains" / f"{underlying}_{expiration:%Y%m%d}{suffix}_chain.parquet"
+    # Descriptive, single-sided filename: the right is always explicit so a cache file names its
+    # option side — `<ticker>_<date>_call_chain.parquet` / `<ticker>_<date>_put_chain.parquet`.
+    if str(right).casefold() not in ("call", "put"):
+        raise ValueError(f"right must be 'call' or 'put', got {right!r}")
+    return data_dir / "chains" / f"{underlying}_{expiration:%Y%m%d}_{str(right).casefold()}_chain.parquet"
 
 
 def _load_chain_cache(path: Path) -> pd.DataFrame:
@@ -176,8 +177,8 @@ def get_chain(
     start: datetime,
     end: datetime,
     fetch_fn: ChainFetchFn,
+    right: str,
     data_dir: Path = DEFAULT_DATA_DIR,
-    right: str = "call",
 ) -> pd.DataFrame:
     """
     Same local-storage-first pattern as `get_bars` — read local cache, fetch only what's missing,
@@ -319,27 +320,28 @@ class DataProvider:
     def is_warmed(self, contract: Contract) -> bool:
         return contract.key in self._frames
 
-    def warm_chain(self, underlying: str, expiration: date, start: datetime, end: datetime, right: str = "call") -> None:
+    def warm_chain(self, underlying: str, expiration: date, start: datetime, end: datetime, right: str) -> None:
         if self.chain_fetch_fn is None:
             raise RuntimeError(
                 "No chain_fetch_fn configured for this DataProvider -- pass chain_fetch_fn to "
                 "DataProvider(...) or run_backtest(...)."
             )
         self._chains[(underlying, expiration, right)] = get_chain(
-            underlying, expiration, start, end, self.chain_fetch_fn, self.data_dir, right
+            underlying, expiration, start, end, self.chain_fetch_fn, right, data_dir=self.data_dir
         )
 
-    def chain_snapshot(self, underlying: str, expiration: date, ts: datetime, right: str = "call") -> pd.DataFrame:
+    def chain_snapshot(self, underlying: str, expiration: date, ts: datetime, right: str) -> pd.DataFrame:
         """
         Full option chain (every listed strike, one side: `right` = "call" or "put") as of the
-        most recent available tick at or before `ts`, indexed by strike. Lazily warms the window
-        from THE DAY THIS IS FIRST CALLED (`ts.date()`) through `expiration`'s session close on
-        first request for a given (underlying, expiration, right), so a second call anywhere in
-        that window (this run, or a rerun reading the persisted Parquet cache) doesn't refetch.
-        Empty DataFrame if no `chain_fetch_fn` is configured, or there's genuinely no data (e.g.
-        no listed expiration that day). Calls and puts are cached and warmed completely
-        independently — a strategy that needs both (e.g. an iron condor) calls this twice, once
-        per side.
+        most recent available tick at or before `ts`, indexed by strike. `right` is REQUIRED
+        ("call" or "put") — the chain is always single-sided and the side must be explicit, never
+        a silent default. Lazily warms the window from THE DAY THIS IS FIRST CALLED (`ts.date()`)
+        through `expiration`'s session close on first request for a given (underlying, expiration,
+        right), so a second call anywhere in that window (this run, or a rerun reading the
+        persisted Parquet cache) doesn't refetch. Empty DataFrame if no `chain_fetch_fn` is
+        configured, or there's genuinely no data (e.g. no listed expiration that day). Calls and
+        puts are cached and warmed completely independently — a strategy that needs both (e.g. an
+        iron condor) calls this twice, once per side.
 
         Warming is scoped to actual market sessions (open -> close), NOT full calendar days —
         requesting midnight-to-midnight would include hours no option ever has data for, which

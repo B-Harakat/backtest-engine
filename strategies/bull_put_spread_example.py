@@ -1,18 +1,22 @@
 """
-0DTE call vertical (debit) spread — written specifically to exercise the engine's multi-leg
-support, not as a strategy with real trading edge.
+0DTE put vertical SHORT (credit) spread — a "bull put spread", bullishly directional, collecting
+a net credit up front. Written to exercise the engine's multi-leg support rather than for real
+trading edge.
 
-At 10:30am ET, buys the nearest out-of-the-money call (the long leg) and sells a further OTM
-call (the short leg, `spread_width` listed strikes further out), both on the same expiration,
+At 10:30am ET, BUYS the nearest out-of-the-money put (the long leg) and SELLS a further OTM put
+(the short leg, `spread_width` listed strikes further down), both on the same expiration,
 simultaneously, tagged with a shared `group_id` so the trade log identifies them as one spread —
 see engine/entities.py's module docstring: "Multi-leg strategies... submitting several
 independent single-leg orders, optionally tagged with a shared group_id."
 
-The two legs are then managed INDEPENDENTLY of each other for the rest of the day: the short leg
-carries its own stop-loss (if the cost to buy it back rises past `short_leg_stop_multiple` times
-the credit collected for it, it's bought back on its own), while the long leg is left completely
-alone regardless of what happens to the short leg. Whichever leg(s) are still open at the end of
-the day settle/force-close through the normal engine mechanisms (see run_backtest's
+The two puts are entered for a net credit: the near (more valuable) put is bought while the far
+(cheaper) put is sold, so the position profits if the underlying stays put or rises.
+
+The two legs are then managed INDEPENDENTLY of each other for the rest of the day: the short far
+leg carries its own stop-loss (if the cost to buy it back rises past `short_leg_stop_multiple`
+times the credit collected for it, it's bought back on its own), while the long near leg is left
+completely alone regardless of what happens to the short leg. Whichever leg(s) are still open at
+the end of the day settle/force-close through the normal engine mechanisms (see run_backtest's
 `settlement_style`) exactly as if they were two entirely unrelated single-leg positions — because,
 as far as the engine's ledger is concerned, that's exactly what they are.
 """
@@ -43,12 +47,12 @@ GRID = {
 }
 
 
-class VerticalSpreadStrategy(Strategy):
+class BullPutSpreadExample(Strategy):
     def __init__(
         self,
         underlying: str = "XSP",
         quantity: int = 1,
-        spread_width: int = 2,  # how many listed strikes further out the short leg is
+        spread_width: int = 2,  # how many listed strikes further out the long leg is
         short_leg_stop_multiple: float = 2.0,  # buy back the short leg alone if its cost doubles
         entry_time: time = ENTRY_TIME,  # intraday time (ET) to enter the spread each session
     ):
@@ -63,6 +67,8 @@ class VerticalSpreadStrategy(Strategy):
         self._warmed_chain_on: Optional[date] = None
 
         # Per-trading-day state for whichever spread is currently open (reset on each new entry).
+        # In this bull put (credit) vertical the NEAR OTM put is the bought long leg and the FAR
+        # OTM put is the sold short leg.
         self._long_leg: Optional[Contract] = None
         self._short_leg: Optional[Contract] = None
         self._short_leg_entry_credit: Optional[float] = None
@@ -95,36 +101,38 @@ class VerticalSpreadStrategy(Strategy):
             return
 
         spot = float(chain["underlying_price"].iloc[0])
-        otm_strikes = sorted(s for s in chain.index if s > spot)
+        # Bull put spread: OTM puts are the strikes BELOW spot. sorted() ascending puts the
+        # NEAREST OTM put (highest strike below spot) last, so take the far-to-near slice.
+        otm_strikes = sorted(s for s in chain.index if s < spot)
         if len(otm_strikes) <= self.spread_width:
             logger.warning(
-                "Not enough OTM strikes (%d) for a %d-wide spread on %s %s -- skipping.",
+                "Not enough OTM put strikes (%d) for a %d-wide spread on %s %s -- skipping.",
                 len(otm_strikes), self.spread_width, self.underlying, expiration,
             )
             self._entered_on = expiration
             return
 
-        long_strike = otm_strikes[0]
-        short_strike = otm_strikes[self.spread_width]
+        long_strike = otm_strikes[-1]                            # near put (buy)
+        short_strike = otm_strikes[-1 - self.spread_width]       # further put (sell)
         long_ask = chain.loc[long_strike, "ask"]
         short_bid = chain.loc[short_strike, "bid"]
-        if pd.isna(long_ask) or pd.isna(short_bid):
+        if pd.isna(short_bid) or pd.isna(long_ask):
             logger.warning("Missing bid/ask for chosen spread legs on %s %s -- skipping.", self.underlying, expiration)
             self._entered_on = expiration
             return
 
-        self._long_leg = Contract(underlying=self.underlying, expiration=expiration, strike=long_strike, right="CALL")
-        self._short_leg = Contract(underlying=self.underlying, expiration=expiration, strike=short_strike, right="CALL")
+        self._long_leg = Contract(underlying=self.underlying, expiration=expiration, strike=long_strike, right="PUT")
+        self._short_leg = Contract(underlying=self.underlying, expiration=expiration, strike=short_strike, right="PUT")
         self._short_leg_entry_credit = float(short_bid)
         self._short_leg_closed = False
-        self._group_id = f"{self.underlying}_{expiration:%Y%m%d}_vertical"
+        self._group_id = f"{self.underlying}_{expiration:%Y%m%d}_bullput_vertical"
 
         self.submit_order(self._long_leg, "BUY_TO_OPEN", self.quantity, limit_price=float(long_ask), group_id=self._group_id)
         self.submit_order(self._short_leg, "SELL_TO_OPEN", self.quantity, limit_price=float(short_bid), group_id=self._group_id)
 
         self._entered_on = expiration
         logger.info(
-            "Entered %s vertical: +%s @ %.2f / -%s @ %.2f",
+            "Entered %s bull put spread: +%s @ %.2f / -%s @ %.2f",
             self.underlying, self._long_leg.key, long_ask, self._short_leg.key, short_bid,
         )
 

@@ -273,8 +273,9 @@ def main(argv: Optional[list[str]] = None) -> dict:
         strategy_cls,
         results,
         output_root=Path(args.output_dir),
+        ticker=underlying,
     )
-    mc_dir = Path(args.output_dir) / strategy_cls.__name__.upper() / "MONTE-CARLO"
+    mc_dir = Path(args.output_dir) / underlying / strategy_cls.__name__ / "MONTE-CARLO"
     print(f"\nMONTE-CARLO written to: {mc_dir.resolve()}")
     return summary
 

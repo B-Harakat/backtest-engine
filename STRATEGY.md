@@ -1,16 +1,19 @@
 # Writing Strategies
 
-This is the guide to authoring a strategy file (e.g. `strategies/vertical_spread_strategy.py`)
+This is the guide to authoring a strategy file (e.g. `strategies/call_credit_spread_example.py`)
 for the backtest engine. It covers the file layout, the engine-provided API a strategy has access
 to, the lifecycle hooks, ordering/position conventions, multi-leg composition, and how strategies
 connect to `run_backtest`, `run_mc`, and the generated reports.
 
 Existing examples to read alongside this guide:
 
-- `strategies/my_strategy.py` — minimal 0DTE single-leg call buy.
-- `strategies/vertical_spread_strategy.py` — a two-leg debit spread with an independent short-leg stop.
-- `strategies/iron_condor_strategy.py` — a four-leg condor across both rights.
-- `strategies/laddered_condor_strategy.py` — multi-day, delta-targeted, rolling "kitchen sink" example.
+
+- `strategies/call_credit_spread_example.py` — a two-leg debit spread with an independent short-leg stop.
+
+- `strategies/bull_put_spread_example.py` — a two-leg credit spread(bullput) with an independent short-leg stop.
+
+- `strategies/iron_condor_example.py` — a four-leg condor across both rights.
+
 
 ---
 
@@ -45,8 +48,8 @@ There is no enforced file layout, but the convention is **one strategy class per
 3. **The `Strategy` subclass** — the class itself.
 
 The engine locates a strategy by spec string `module.path:ClassName`, so for
-`strategies/vertical_spread_strategy.py` the spec is
-`strategies.vertical_spread_strategy:VerticalSpreadStrategy`.
+`strategies/call_credit_spread_example.py` the spec is
+`strategies.call_credit_spread_example:CallCreditSpreadExample`.
 
 ### Minimal skeleton
 
@@ -238,16 +241,12 @@ scoped to **0DTE intraday** sessions. A strategy designed for `run_mc` should th
 
 ### Real backtest (ThetaData data)
 ```bash
-python scripts/run_backtest.py \
-  --strategy strategies.vertical_spread_strategy:VerticalSpreadStrategy \
-  --start 2025-02-25 --end 2025-03-15 --cash 10000 --ticker XSP
+python scripts/run_backtest.py --strategy strategies.call_credit_spread_example:CallCreditSpreadExample --start 2026-07-01 --end 2026-07-31 --cash 10000 --ticker XSP 
 ```
 
 ### Monte Carlo (synthetic Bates paths)
 ```bash
-python scripts/run_mc.py \
-  --strategy strategies.vertical_spread_strategy:VerticalSpreadStrategy \
-  --start 2025-02-25 --end 2025-03-15 --ticker XSP --n-paths 2 --seed 7 --cash 10000
+python scripts/run_mc.py --strategy strategies.   call_credit_spread_example:CallCreditSpreadExample --start 2025-02-25 --end 2025-03-15 --ticker XSP --n-paths 2 --seed 7 --cash 10000
 ```
 
 ### Output & reporting
