@@ -33,8 +33,9 @@ You write **decision logic only**. You never manage cash, fills, positions, or d
 you use the engine-provided helpers to query data and submit orders, and the engine does the rest.
 
 There is **no threading or scheduler**, and there is **no current-price argument** passed into
-`on_bar`. To see the underlying's price, use `get_chain_snapshot()` (which sources the underlying
-price from option chain data rather than a separate index feed).
+`on_bar`. To see the underlying's price, use `get_chain_snapshot(..., right="call"/"put")` (which
+sources the underlying price from option chain data rather than a separate index feed; `right` is
+required — the chain is single-sided).
 
 ---
 
@@ -61,11 +62,10 @@ from engine.strategy import Strategy
 
 
 class MyNewStrategy(Strategy):
-    def __init__(self, underlying: str = "XSP", quantity: int = 1, entry_time: time = time(10, 30)):
+    def __init__(self, underlying: str = "XSP", quantity: int = 1):
         super().__init__()
         self.underlying = underlying
         self.quantity = quantity
-        self.entry_time = entry_time
 
     def initialize(self):
         # Pre-declare contracts you always trade (optional but recommended).
@@ -125,7 +125,7 @@ All of these are methods on your strategy; none require you to touch `DataProvid
 | `self.get_bars(contract, lookback=1)` | `pd.DataFrame` | most recent `lookback` bars for a contract, up to and including now |
 | `self.get_quote(contract)` | `dict` / `None` | `{"bid": ..., "ask": ...}` at or before now |
 | `self.get_greeks(contract)` | `dict` / `None` | most recent greeks (delta/gamma/theta/vega/rho/vanna/charm/implied_vol/underlying_price) |
-| `self.get_chain_snapshot(underlying, expiration, right="call")` | `pd.DataFrame` | full one-side chain indexed by strike, with `underlying_price` and `delta` columns |
+| `self.get_chain_snapshot(underlying, expiration, right)` | `pd.DataFrame` | full ONE-side chain indexed by strike, with `underlying_price` and `delta` columns. `right` is REQUIRED — "call" or "put" (the chain is single-sided; no default). Call/put fetches are independent — request each side once if you need both. |
 | `self.cash()` | `float` | current account cash |
 | `self.positions()` | `list[Position]` | currently open positions |
 | `self.get_position(contract)` | `Position` / `None` | open position for a specific contract |
@@ -241,29 +241,32 @@ scoped to **0DTE intraday** sessions. A strategy designed for `run_mc` should th
 
 ### Real backtest (ThetaData data)
 ```bash
-python scripts/run_backtest.py --strategy strategies.call_credit_spread_example:CallCreditSpreadExample --start 2026-07-01 --end 2026-07-31 --cash 10000 --ticker XSP 
+python scripts/run_backtest.py --strategy strategies.call_credit_spread_example:CallCreditSpreadExample --start 2023-01-01 --end 2023-01-13 --cash 10000 --ticker XSP
 ```
 
 ### Monte Carlo (synthetic Bates paths)
 ```bash
-python scripts/run_mc.py --strategy strategies.   call_credit_spread_example:CallCreditSpreadExample --start 2025-02-25 --end 2025-03-15 --ticker XSP --n-paths 2 --seed 7 --cash 10000
+python scripts/run_mc.py --strategy strategies.call_credit_spread_example:CallCreditSpreadExample --start 2023-01-01 --end 2023-01-13 --n-paths 2 --seed 7 --cash 10000 --ticker XSP
 ```
 
 ### Output & reporting
 
-Both entry points write reports under `output/`, organized by **your strategy class name,
-uppercased**.
+Both entry points write reports under `output/`, organized by **underlying/ticker first, then your
+strategy class name, uppercased** — i.e. `output/<ticker>/<STRATEGY>/{...}`. The ticker layer keeps
+runs for different symbols (e.g. XSP vs SPX) cleanly separated.
 
-- `run_backtest` writes `output/<STRATEGY>/HISTORY/`:
+- `run_backtest` writes `output/<ticker>/<STRATEGY>/HISTORY/`:
   - `trade_log.csv` — every fill (including expiration settlements).
   - `cash_equity.csv` — daily granularity (`date`, `cash`, `equity`).
   - `summary.json` — full statistics battery.
-- `run_mc` writes `output/<STRATEGY>/MONTE-CARLO/`:
+- `run_mc` writes `output/<ticker>/<STRATEGY>/MONTE-CARLO/`:
   - `<date>.csv` per day — columns are parameter sets, rows are pooled statistics
     (`{stat}_mean/{stat}_p05/{stat}_p95`) per report.
   - `_summary.csv` — each statistic averaged across days per parameter set.
+    The folder is wiped of stale `.csv` files before each run, so only the current run's dates
+    remain.
 
-Because the output folder is the **class name** (`VERTICALSPREADSTRATEGY`), two different
+Because the strategy-level folder is the **class name** (`CallCreditSpreadExample`), two different
 classes with the same name would collide — keep class names unique. Your constructor parameter
 values are used to label Monte-Carlo columns (e.g. `spread_width=2|entry_time=10:00`), so give
 parameters short, descriptive names.
@@ -276,7 +279,7 @@ parameters short, descriptive names.
 - `qty` is always positive; direction lives in the `side`.
 - The underlying symbol param should be named `underlying` for `--ticker` to work.
 - You never manage cash/positions/fills — only submit orders and read data.
-- No price argument is passed to `on_bar`; get price/strikes from `get_chain_snapshot()`.
+- No price argument is passed to `on_bar`; get price/strikes from `get_chain_snapshot(..., right=...)`, passing the required "call" or "put".
 - Multi-leg structures are just independently-managed single contracts sharing a `group_id`.
 - For `run_mc`, define a `GRID` dict and keep the strategy 0DTE-compatible.
 - Class names become output-folder names — keep them unique and descriptive.
