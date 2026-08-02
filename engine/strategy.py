@@ -65,6 +65,23 @@ class Strategy:
     def get_datetime(self) -> datetime:
         return self._current_ts
 
+    def get_run_multiplier(self) -> int:
+        """
+        The run-level option contract multiplier ($ per point of intrinsic value per contract)
+        actually used by the ledger (default 100). Before the strategy is attached to a portfolio
+        (e.g. in your constructor), the engine default `DEFAULT_OPTION_MULTIPLIER` is returned.
+
+        Risk-based position sizing needs this to convert premium *points* into dollars —
+        ``size_position(..., multiplier=self.get_run_multiplier())``. Asking the engine here
+        (instead of hardcoding a copy) guarantees consistency with the accounting layer even if
+        ``--multiplier`` is overridden on the CLI.
+        """
+        if self._portfolio is not None and self._portfolio.multiplier is not None:
+            return int(self._portfolio.multiplier)
+        from engine.entities import DEFAULT_OPTION_MULTIPLIER
+
+        return DEFAULT_OPTION_MULTIPLIER
+
     def get_bars(self, contract: Contract, lookback: int = 1) -> pd.DataFrame:
         """Most recent `lookback` bars for `contract`, up to and including now."""
         return self._data.bars_up_to(contract, self._current_ts).tail(lookback)
@@ -141,6 +158,52 @@ class Strategy:
 
     def cash(self) -> float:
         return self._portfolio.cash
+
+    def spread_value(self) -> Optional[float]:
+        """
+        Cost-to-close of every currently-open position, in premium points **per contract**
+        (not scaled by position qty). Short legs (qty < 0) valued at their current ask,
+        long legs (qty > 0) at their current bid. Returns None if any open leg has no
+        usable quote this bar — caller rechecks next bar.
+
+        Returns a per-contract value so it's directly comparable to per-contract entry
+        credits/debits used by profit-target logic.
+        """
+        total = 0.0
+        found = False
+        for pos in self._portfolio.positions.values():
+            if pos.qty == 0:
+                continue
+            q = self.get_quote(pos.contract)
+            if q is None:
+                return None
+            total += q["ask"] if pos.qty < 0 else q["bid"]
+            found = True
+        return total if found else 0.0
+
+    def aggregate_greeks(self) -> dict[str, float]:
+        """
+        Summed raw (per-unit, before multiplier scaling) greeks across all open positions.
+        Positive delta = net long, negative = net short. Gamma/theta/vega/rho/vanna/charm
+        are signed by position direction (long legs add, short legs subtract).
+
+        Returns a dict with keys matching ``_GREEK_COLUMNS`` plus ``underlying_price``.
+        Positions with no greek data this bar are silently skipped.
+        """
+        totals: dict[str, float] = {c: 0.0 for c in _GREEK_COLUMNS}
+        for pos in self._portfolio.positions.values():
+            if pos.qty == 0:
+                continue
+            g = self.get_greeks(pos.contract)
+            if g is None:
+                continue
+            sign = 1 if pos.qty > 0 else -1
+            for col in _GREEK_COLUMNS:
+                if col in g and g[col] is not None:
+                    totals[col] += g[col] * sign
+            if "underlying_price" in g and g["underlying_price"] is not None:
+                totals.setdefault("underlying_price", 0.0)
+        return totals
 
     def watch(self, contract: Contract, start: Optional[datetime] = None, end: Optional[datetime] = None) -> None:
         """Pre-fetch/pre-cache `contract`'s data for [start, end] (default: the full backtest

@@ -6,3 +6,6 @@ lib/
 __pycache__/
 *.pyc
 
+tmp_conform.md
+tmp_pseudocode_to_backtest.md
+tmp_pseudoskill.md
